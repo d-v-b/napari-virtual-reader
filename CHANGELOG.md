@@ -5,6 +5,33 @@
 Notable changes to napari-virtual-reader are recorded here. Publication status
 is recorded separately from the release preparation date.
 
+## Unreleased
+
+### Changed
+
+- Added lazy, chunk-local mosaic assembly for supported 2D CZI slide scans:
+  combine irregular native tiles and stored pyramid levels on a common extent,
+  preserve RGB/scalar channels and calibration, fill gaps with zero, and resolve
+  overlaps in numeric tile order. Record the assembly policy in layer metadata.
+  Unsupported tiles keep the incomplete-view warning. VZIP export retains the
+  original refkv layout, not the runtime mosaic.
+- Warn when a CZI view omits unassembled tiles, including partial pyramids,
+  and preserve the warning in layer metadata. Applies to reader loads and
+  the opener, without reading pixels or changing image assembly.
+- Packed-colour CZI images now open as one RGB/RGBA layer per acquisition
+  channel instead of separate B/G/R(/A) layers, including CZI-derived VZIP
+  metadata. Preserve lazy pyramids and scene stacks, handle codec-dependent
+  component order, and leave scalar fluorescence channels unchanged.
+- Combined the file opener and metadata inspector in one plugin dock, with
+  loading and optional VZIP-save controls above the expanding inspector.
+- File/Open, canvas drag-and-drop, and the plugin menu now share the same dock
+  regardless of opening order; reader loads reopen it when hidden.
+
+### Fixed
+
+- Prevented the metadata inspector from appearing as a separate dock above
+  the file-loading controls.
+
 ## 0.0.2 - 2026-11-06
 
 ### Changed

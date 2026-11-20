@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en" data-register="blueprint">
+<head>
+<title>napari-virtual-reader visual guides</title>
+<link rel="stylesheet" href="kit.css" data-ve-kit>
+</head>
+<body>
+<main>
+<header><p class="eyebrow">napari-virtual-reader</p><h1>Read the image, not a converted copy.</h1><p class="lead">Two visual guides to reference-backed image loading and lazy CZI mosaic assembly.</p></header>
+<section><h2><a href="plugin-workflow.html">The plugin workflow</a></h2><p>Follow a local image into napari: reference-backed Zarr, lazy layers, the combined dock, metadata and optional VZIP saving.</p></section>
+<section><h2><a href="czi-tile-assembly.html">CZI tile assembly in detail</a></h2><p>See how tile placement restores supported CZI coverage and lazy chunk reads avoid building the whole slide in memory.</p><p>This extra assembly is CZI-only. Other formats can use refkv's existing images and pyramids, but their separate irregular tiles are not yet assembled by this plugin.</p></section>
+<section class="sources" aria-label="Repository"><p><a href="https://github.com/sebi06/napari-virtual-reader">Repository and installation</a></p><p>Experimental software. Validate scientific results independently. The guides describe the current implementation and its limits.</p></section>
+</main>
+</body>
+</html>

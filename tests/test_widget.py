@@ -77,22 +77,29 @@ def test_closed_dock_discards_results(qtbot):
 
 
 @pytest.mark.parametrize("already_open", [False, True])
-def test_metadata_dock_follows_active_layer(qtbot, make_napari_viewer, already_open):
-    """Use one right-side inspector for existing images and later reader loads."""
+def test_combined_dock_follows_active_layer(qtbot, make_napari_viewer, already_open):
+    """Keep opening controls above the inspector for existing and later images."""
+    from napari_virtual_reader._metadata import MetadataPanel
+
     viewer = make_napari_viewer()
     root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
     root.create_array("0", data=np.zeros((8, 10), dtype="uint16"))
     root.attrs["ome"] = {"multiscales": [{"axes": ["y", "x"], "datasets": [{"path": "0"}]}]}
     data, kwargs, _ = _layers(root, Path("example.tif"))[0]
     first = viewer.add_image(data, **kwargs) if already_open else None
-    widget = VirtualReaderWidget(viewer)
-    qtbot.addWidget(widget)
+    dock, widget = viewer.window.add_plugin_dock_widget("napari-virtual-reader")
     if first is None:
         first = viewer.add_image(data, **kwargs)
-    dock = widget._metadata_dock
-    assert dock is not None
     assert viewer.window._qt_window.dockWidgetArea(dock) == Qt.RightDockWidgetArea
     panel = widget.metadata_panel
+    assert widget.isAncestorOf(panel)
+    assert viewer.window._qt_window.findChildren(MetadataPanel) == [panel]
+    assert len(viewer.window._qt_window.findChildren(VirtualReaderWidget)) == 1
+    viewer.window._qt_window.show()
+    qtbot.waitExposed(widget)
+    assert widget.open_button.mapTo(widget, widget.open_button.rect().bottomLeft()).y() < panel.y()
+    assert panel.geometry().bottom() == widget.contentsRect().bottom() - widget.layout().contentsMargins().bottom()
+    assert viewer.window.add_plugin_dock_widget("napari-virtual-reader") == (dock, widget)
     assert panel.source.text() == "example.tif"
     assert panel.structure.topLevelItem(0).text(0) == "/"
     arrays = [
@@ -116,13 +123,13 @@ def test_metadata_dock_follows_active_layer(qtbot, make_napari_viewer, already_o
     assert panel.structure.topLevelItemCount() == 0
     assert panel.source.text() == ""
     viewer.layers.selection.active = first
-    assert widget._metadata_dock is dock
     assert panel.source.text() == "example.tif"
     assert panel.metadata.findItems("ome", Qt.MatchExactly | Qt.MatchRecursive, 0)
 
 
-def test_reader_only_open_creates_metadata_dock(tmp_path, qtbot, make_napari_viewer):
-    """File/Open must show metadata without first opening the plugin widget."""
+@pytest.mark.parametrize("opener_first", [False, True])
+def test_reader_and_plugin_share_combined_dock(tmp_path, qtbot, make_napari_viewer, opener_first):
+    """File/Open and the plugin menu share one dock in either opening order."""
     import tifffile
 
     from napari_virtual_reader._metadata import MetadataPanel
@@ -131,22 +138,25 @@ def test_reader_only_open_creates_metadata_dock(tmp_path, qtbot, make_napari_vie
     tifffile.imwrite(source, np.zeros((8, 10), dtype="uint16"), metadata={"axes": "YX"})
     viewer = make_napari_viewer()
     assert not viewer.window._qt_window.findChildren(VirtualReaderWidget)
+    if opener_first:
+        viewer.window.add_plugin_dock_widget("napari-virtual-reader")
     viewer.open(str(source), plugin="napari-virtual-reader")
     qtbot.waitUntil(lambda: bool(viewer.window._qt_window.findChildren(MetadataPanel)))
     panels = viewer.window._qt_window.findChildren(MetadataPanel)
     assert len(panels) == 1
     panel = panels[0]
-    assert viewer.window._qt_window.dockWidgetArea(panel.dock) == Qt.RightDockWidgetArea
-    assert panel.source.text() == "image.tif"
-    assert not panel.dock.isHidden()
-    assert not viewer.window._qt_window.findChildren(VirtualReaderWidget)
-    panel.dock.hide()
-    viewer.open(str(source), plugin="napari-virtual-reader")
-    assert not panel.dock.isHidden()
-    assert len(viewer.window._qt_window.findChildren(MetadataPanel)) == 1
-    widget = VirtualReaderWidget(viewer)
-    qtbot.addWidget(widget)
+    dock, widget = viewer.window.add_plugin_dock_widget("napari-virtual-reader")
     assert widget.metadata_panel is panel
+    assert widget.isAncestorOf(panel)
+    assert viewer.window._qt_window.findChildren(VirtualReaderWidget) == [widget]
+    assert viewer.window._qt_window.dockWidgetArea(dock) == Qt.RightDockWidgetArea
+    assert panel.source.text() == "image.tif"
+    assert not dock.isHidden()
+    dock.hide()
+    viewer.open(str(source), plugin="napari-virtual-reader")
+    assert not dock.isHidden()
+    assert len(viewer.window._qt_window.findChildren(MetadataPanel)) == 1
+    assert viewer.window.add_plugin_dock_widget("napari-virtual-reader") == (dock, widget)
 
 
 def test_widget_saves_archive_in_background(tmp_path, qtbot, make_napari_viewer, monkeypatch):

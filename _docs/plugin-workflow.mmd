@@ -1,0 +1,11 @@
+flowchart TD
+    Input["Local input"] -->|select raw image| Raw["zarrify"]
+    Input -->|select VZIP| Archive["refkv.zarr.open"]
+    Raw -->|wrap references| Store["Zarr group"]
+    Archive -->|expose references| Store
+    Store -->|find OME images| Layers["Lazy layers"]
+    Raw -.->|supply live CZI factors| CZI["CZI assembly"]
+    Layers -->|route supported CZI| CZI
+    Layers -->|keep other formats| View["napari image layers"]
+    CZI -->|stack compatible scenes| View
+    View -->|select layer| Metadata["Metadata inspector"]

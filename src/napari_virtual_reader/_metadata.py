@@ -1,4 +1,10 @@
-"""Read-only inspector for virtual Zarr structure and selected-layer metadata."""
+"""Read-only inspector for virtual Zarr structure and selected-layer metadata.
+
+The reader snapshots store metadata during preparation. This module renders that
+snapshot and follows napari's active-layer selection; it never indexes image
+arrays. Dock creation is shared with the opener so File/Open does not create a
+second, competing metadata window.
+"""
 
 import json
 from pathlib import Path
@@ -9,6 +15,7 @@ from qtpy.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QSizePolicy,
     QSplitter,
     QStyle,
     QTabWidget,
@@ -23,35 +30,48 @@ from superqt.utils import ensure_main_thread
 
 
 def ensure_metadata_panel(viewer: Any) -> "MetadataPanel":
-    """Share one right-hand inspector between the opener and reader workflows."""
-    panels = viewer.window._qt_window.findChildren(MetadataPanel)
-    if panels:
-        panels[0].dock.show()
-        return panels[0]
-    panel = MetadataPanel()
-    panel.viewer = viewer
-    panel.dock = viewer.window.add_dock_widget(panel, name="Virtual Zarr metadata", area="right")
-    viewer.layers.selection.events.active.connect(panel._active_layer_changed)
-    panel._active_layer_changed()
-    return panel
+    """Reuse the plugin dock for both reader and opener workflows.
+
+    Use napari's registered plugin dock rather than constructing the widget
+    directly: the plugin menu and reader-triggered loads then share ownership.
+    Showing an existing dock also restores it after the user has hidden it.
+    """
+    dock, widget = viewer.window.add_plugin_dock_widget("napari-virtual-reader")
+    dock.show()
+    return widget.metadata_panel
 
 
 @ensure_main_thread
 def prepare_metadata_inspectors() -> None:
-    """Attach reader-only loads to live viewers, even when called by a worker."""
+    """Attach reader-only loads to live viewers, even when called by a worker.
+
+    The reader hook receives paths, not a target viewer. Attach to the current
+    viewer instances and let each inspector follow its own selection. The
+    decorator marshals all widget creation onto the Qt main thread.
+    """
     from napari import Viewer
 
+    # Snapshot napari's instance collection before any UI creation can alter it.
     for viewer in tuple(Viewer._instances):
         ensure_metadata_panel(viewer)
 
 
 class MetadataPanel(QWidget):
-    """Browse source hierarchy and attributes without accessing array values."""
+    """Browse source hierarchy and attributes without accessing array values.
 
-    def __init__(self) -> None:
+    Tree cells contain short summaries. Qt.UserRole retains the complete value
+    for the detail pane, so long metadata does not force the dock to expand.
+    """
+
+    def __init__(self, viewer: Any) -> None:
         super().__init__()
+        self.viewer = viewer
         self.setMinimumWidth(280)
+        # Tell the enclosing dock that this panel can use spare vertical space;
+        # otherwise napari can place unused stretch below the entire widget.
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
         self.source = QLabel()
         self.source.setWordWrap(True)
         self.source.setTextFormat(Qt.PlainText)
@@ -75,6 +95,8 @@ class MetadataPanel(QWidget):
             button.setIcon(self.style().standardIcon(icon))
             button.setToolTip(tooltip)
             button.setAccessibleName(tooltip)
+            # Capture this iteration's method, but choose the current tab at
+            # click time. Without the default argument both buttons would collapse.
             button.clicked.connect(lambda checked=False, method=method: getattr(self.tabs.currentWidget(), method)())
             row.addWidget(button)
         layout.addLayout(row)
@@ -96,6 +118,8 @@ class MetadataPanel(QWidget):
             tree.currentItemChanged.connect(self._selected)
         self.search.textChanged.connect(self._filter)
         self.tabs.currentChanged.connect(lambda: self.detail.clear())
+        viewer.layers.selection.events.active.connect(self._active_layer_changed)
+        self._active_layer_changed()
 
     def _property(self, parent: Any, name: str, value: Any) -> None:
         """Represent structured attributes as expandable keys and indexed lists."""
@@ -114,7 +138,7 @@ class MetadataPanel(QWidget):
             self._property(item, str(key), child)
 
     def _active_layer_changed(self, event=None) -> None:
-        """Follow image selection independently of the optional opener widget."""
+        """Follow image selection regardless of how the image was opened."""
         self.set_layer(self.viewer.layers.selection.active)
 
     def _node(self, parent: Any, name: str, node: dict) -> None:
@@ -123,6 +147,7 @@ class MetadataPanel(QWidget):
         layout = "group"
         if node["kind"] == "array":
             shape = " x ".join(str(size) for size in metadata["shape"])
+            # Zarr metadata versions use different dtype keys in their dictionaries.
             layout = f"{shape} | {metadata.get('data_type', metadata.get('dtype', ''))}"
         item = QTreeWidgetItem(parent, [name, layout])
         properties = metadata if node["kind"] == "array" else node["attributes"]
@@ -133,6 +158,8 @@ class MetadataPanel(QWidget):
 
     def set_layer(self, layer: Any) -> None:
         """Display one selected layer, clearing stale metadata for other layers."""
+        # Clear before checking provenance: selecting an unrelated layer must not
+        # leave the previous virtual image's source or attributes on screen.
         for tree in self.trees:
             tree.clear()
         self.detail.clear()
@@ -153,6 +180,8 @@ class MetadataPanel(QWidget):
 
     def _selected(self, item: Any, previous: Any) -> None:
         """Expose complete, selectable values without widening the tree columns."""
+        # Plain text avoids interpreting source attributes as HTML. default=str
+        # keeps non-JSON metadata inspectable without modifying the stored values.
         self.detail.setPlainText(
             json.dumps(item.data(0, Qt.UserRole), indent=2, ensure_ascii=True, default=str) if item else ""
         )
@@ -162,6 +191,9 @@ class MetadataPanel(QWidget):
         text = text.casefold()
 
         def visit(item: QTreeWidgetItem) -> bool:
+            # Visit every child before testing the parent. Short-circuiting the
+            # recursion would leave stale hidden states after changing a filter.
+            # A matching descendant keeps its ancestor path visible and expanded.
             child_matches = [visit(item.child(index)) for index in range(item.childCount())]
             matches = not text or text in f"{item.text(0)} {item.text(1)}".casefold() or any(child_matches)
             item.setHidden(not matches)
