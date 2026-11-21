@@ -21,13 +21,14 @@ main { overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
-<nav class="ve-toc" aria-label="Sections"><div><a href="#idea">Idea</a><a href="#prepare">Preparation</a><a href="#request">Chunk read</a><a href="#coordinates">Coordinates</a><a href="#levels">Pyramids</a><a href="#limits">Limits</a></div><span class="pos"></span></nav>
+<nav class="ve-toc" aria-label="Sections"><div><a href="#idea">Idea</a><a href="#prepare">Preparation</a><a href="#request">Chunk read</a><a href="#coordinates">Coordinates</a><a href="#levels">Tile levels</a><a href="#scenes">Scene canvases</a><a href="#limits">Limits</a></div><span class="pos"></span></nav>
 <main>
 <header id="idea">
 <div class="home-links"><a href="index.html">Visual guides</a><a href="plugin-workflow.html">Plugin workflow</a><a href="https://github.com/sebi06/napari-virtual-reader">Repository</a></div>
 <p class="eyebrow">napari-virtual-reader / CZI implementation</p>
 <h1>Place tiles now. Read their pixels later.</h1>
 <p class="lead">A spatial index turns irregular CZI tiles into lazy, aligned pyramid arrays without writing a full mosaic.</p>
+<p class="meta">Source-checkout guide / includes unreleased scene-canvas support.</p>
 </header>
 <figure class="ve-steps">
 <div class="frame"><svg class="ve-svg" viewBox="0 0 900 390" role="img" aria-label="Two overlapping tiles share a native coordinate frame; numeric tile 10 overwrites tile 2 and uncovered corners remain zero.">
@@ -67,13 +68,14 @@ flowchart TD
 <div class="split">
 <div><h3>Eligibility</h3><ul><li>An existing 2D OME image and the live refkv image-factor summary are required.</li><li>Tiles need placement, native size, stored size and plane metadata.</li><li>Only <code>(y, x)</code> or <code>(c, y, x)</code> tiles qualify.</li><li>Scene/block dimensions must match, with one common time/Z plane origin.</li><li>The acquisition channel, packed component count and dtype must fit the layer.</li></ul></div>
 <div><h3>One piece per source and channel</h3><pre>_Piece
-  array              lazy Zarr source
+  array              lazy source
   x, y               native origin
   width, height      native footprint
   factor             level classification
   channel            local acquisition index
   order              RGB(A) permutation
-  has_c              source has C axis</pre><p>A piece can represent a regular image level or an irregular tile. Regular sources come first; numeric tile names follow.</p></div>
+  has_c              source has C axis
+  channels_last      prepared YX / YXC</pre><p>A piece can represent a regular image level or an irregular tile. Regular sources come first; numeric tile names follow. Prepared scene arrays reuse the same piece reader.</p></div>
 </div>
 <details><summary>How the resolution factor is classified</summary><p>Equal native and stored sizes mean native resolution. Otherwise the classifier uses the longer stored axis, choosing Y on ties. It checks powers of two before powers of three, with the tolerances specified by refkv's CZI profile. It does not simply round to the nearest power. Unknown factors remain unassembled.</p></details>
 <p>Irregular placement, overlap and interior clipping can prevent refkv from exposing a level as one regular array. Different tile sizes alone are not proof that assembly is impossible.</p>
@@ -137,7 +139,7 @@ napari_scale_x = native_pixel_size_x * finest_step_x
 napari_translate_x = native_pixel_size_x * (x0 + (finest_step_x - 1) / 2)</pre><p>Y uses the same calculation. Regular origins must be integral within the code's tolerance; ambiguous translations or mismatched summaries raise errors. Array order is Y, X, then optional RGB(A); placement metadata uses X, Y.</p></details>
 </section>
 <section id="levels">
-<div class="sec-head"><p class="ve-label caps">Pyramids</p><h2>Reuse available levels; do not invent missing ones.</h2></div>
+<div class="sec-head"><p class="ve-label caps">Tile pyramids</p><h2>Recover stored tile levels, not missing native data.</h2></div>
 <figure>
 <div class="frame"><svg class="ve-svg" viewBox="0 0 850 295" role="img" aria-label="Native, factor-two and factor-four levels share one extent but have fewer samples; the finest pieces define the extent.">
 <text class="ve-tag" x="40" y="32">ILLUSTRATIVE AVAILABLE FACTORS</text>
@@ -154,6 +156,29 @@ napari_translate_x = native_pixel_size_x * (x0 + (finest_step_x - 1) / 2)</pre><
 <p>Native tiles preserve full-resolution samples. Coarse levels use nearest-neighbour sampling on the common extent. A missing factor is not synthesized; a gap at one level is not filled from another.</p>
 <div class="split"><div><h3>Why a small file once had a pyramid</h3><p>refkv already exposed multiple regular overview levels. The original reader could display those without displaying the irregular native tiles.</p></div><div><h3>Why a larger file could have only one level</h3><p>Only one overview could be represented as a regular array. Other resolutions remained separate tile arrays until this assembly stage incorporated them.</p></div></div>
 </section>
+<section id="scenes">
+<div class="sec-head"><p class="ve-label caps">Scene canvases</p><h2>The same chunk reader also combines matching scenes.</h2></div>
+<figure>
+<div class="frame"><svg class="ve-svg" viewBox="0 0 900 285" role="img" aria-label="Matching scene arrays are placed as pieces, indexed by output chunk, and sampled into one lazy canvas pyramid per channel.">
+<path class="ve-e" d="M240 110H345"/><text class="ve-el" x="292" y="87">places</text>
+<path class="ve-e" d="M555 110H660"/><text class="ve-el" x="607" y="87">samples</text>
+<g class="ve-n"><rect class="sh" x="30" y="65" width="210" height="90"/><text x="135" y="91">Original scenes</text><text class="sub" x="135" y="117">lazy YX or YXC</text><text class="sub" x="135" y="140">stored pyramid arrays</text></g>
+<g class="ve-n"><rect class="sh" x="345" y="65" width="210" height="90"/><text x="450" y="91">Spatial pieces</text><text class="sub" x="450" y="117">physical origins</text><text class="sub" x="450" y="140">output-chunk bins</text></g>
+<g class="ve-n is-key"><rect class="sh" x="660" y="65" width="210" height="90"/><text x="765" y="91">One channel layer</text><text class="sub" x="765" y="117">spatial canvas</text><text class="sub" x="765" y="140">lazy overviews</text></g>
+<path class="ve-e is-async" d="M765 165V215H135V165"/><text class="ve-el" x="450" y="202">switch back to S: restore original scene arrays</text>
+<text class="note" x="30" y="263">Scene composition adds display overviews, not missing source tiles or native detail.</text>
+</svg></div>
+<figcaption><span class="fig-n">Fig. 6</span>Scene-canvas overviews sample existing scene sources; native S restoration uses the original arrays, not the composed pixels.</figcaption>
+</figure>
+<div class="split">
+<div><h3>Tile assembly recovers source coverage</h3><p><code>assemble_czi_layers</code> uses native tile footprints and refkv's live factor summary. It groups available source resolutions without inventing missing tile factors.</p></div>
+<div><h3>Scene composition makes a display canvas</h3><p><code>compose_scene_canvas</code> converts scene origins into a common pixel frame. It reuses stored scene levels, then samples extra overviews when the canvas remains too large.</p></div>
+</div>
+<p>Overview generation halves the output shape until its longest side fits an output chunk. Each added overview keeps the common extent and reads intersecting regions from the coarsest available scene sources. No dense full-resolution canvas is needed.</p>
+<p>Matching 2D Y/X scenes without rotation or shear keep one layer per acquisition channel in both modes. Native S stacks can also hold compatible higher-dimensional scenes, but their canvas view retains separate layers. Other nonmatching scenes retain the dock slider and individual layers.</p>
+<p>The canvas fills gaps with zero, gives later numeric scenes overlap priority and uses nearest-neighbour sampling for fractional placement. The dock preserves source arrays, pyramid levels and display settings for the return to native S.</p>
+<p>Scene composition can use regular images from CZI-derived VZIP archives. It does not remove the archive's separate-tile limitation: native tile assembly still needs the live calibration summary from the original CZI.</p>
+</section>
 <section id="limits">
 <div class="sec-head"><p class="ve-label caps">Policies and limits</p><h2>A deterministic view is not a ZEN-identical rendering.</h2></div>
 <figure>
@@ -162,7 +187,7 @@ napari_translate_x = native_pixel_size_x * (x0 + (finest_step_x - 1) / 2)</pre><
 <div class="case" data-st="warn"><span class="chip warn">Still warned</span><h3>Some tiles or channels unused</h3><svg class="ve-mini" viewBox="0 0 240 110" role="img" aria-label="Used and unused tiles remain distinguishable"><rect class="tile" x="20" y="20" width="80" height="60"/><rect class="gap" x="120" y="20" width="80" height="60"/><text class="note" x="123" y="98">unused</text></svg></div>
 <div class="case" data-st="risk"><span class="chip risk">Not a fallback</span><h3>Missing or unreadable data</h3><svg class="ve-mini" viewBox="0 0 240 110" role="img" aria-label="Decode errors propagate rather than silently painting zeros"><rect class="tile" x="20" y="20" width="80" height="60"/><path class="line" d="M130 30L185 85M130 85L185 30"/><text class="note" x="120" y="103">error</text></svg></div>
 </div>
-<figcaption><span class="fig-n">Fig. 6</span>Only fully consumed tile arrays leave the warning count; a tile with unused acquisition channels is still reported.</figcaption>
+<figcaption><span class="fig-n">Fig. 7</span>Only fully consumed tile arrays leave the warning count; a tile with unused acquisition channels is still reported.</figcaption>
 </figure>
 <ul><li><strong>Overlap:</strong> regular sources first, then tiles in numeric name order. Later sources overwrite earlier ones; there is no blending or registration.</li><li><strong>Incomplete views:</strong> time/Z stacks, unclassified tile factors and incompatible placement/channel metadata are not assembled.</li><li><strong>No OME image:</strong> tile-only sources do not get a guessed image; inputs without any supported OME image fail explicitly.</li><li><strong>VZIP:</strong> reopening lacks the live factor summary. The saved original reference layout is not this runtime composition.</li><li><strong>Warnings:</strong> remaining tiles produce one source-load warning and <code>metadata["reader_warning"]</code>.</li><li><strong>Provenance:</strong> <code>metadata["czi_assembly"]</code> records bounds, factors, full-resolution availability, incorporated tile count, overlap and sampling policies.</li></ul>
 <div class="boundary-note"><strong>Use the original CZI for assembly.</strong> ZEN/libCZI may choose different overlapping tiles, and codec rounding can differ. Validate pixels independently before quantitative use.</div>
@@ -170,7 +195,7 @@ napari_translate_x = native_pixel_size_x * (x0 + (finest_step_x - 1) / 2)</pre><
 </section>
 <section class="sources" aria-label="Sources">
 <p class="ve-label caps">Implementation and evidence</p>
-<p><a href="https://github.com/sebi06/napari-virtual-reader/blob/main/src/napari_virtual_reader/_czi_mosaic.py">_czi_mosaic.py: _Piece, _Mosaic, _sample_axis and assemble_czi_layers</a><br><a href="https://github.com/sebi06/napari-virtual-reader/blob/main/src/napari_virtual_reader/_reader.py">_reader.py: RGB ordering, scene stacking and residual warnings</a><br><a href="https://github.com/sebi06/napari-virtual-reader/blob/main/tests/test_czi_mosaic.py">Tests: native pixels, overlap, gaps, lazy reads, odd extents, scenes and errors</a><br><a href="https://github.com/d-v-b/refkv/blob/main/spec/zarrify/czi.md">refkv CZI profile: factors, placement and calibration</a><br><a href="https://github.com/sebi06/napari-virtual-reader/blob/main/_docs/czi-tile-assembly.mmd">Editable Mermaid diagram</a></p>
+<p><a href="https://github.com/sebi06/napari-virtual-reader/blob/main/src/napari_virtual_reader/_czi_mosaic.py">_czi_mosaic.py: pieces, spatial index, tile assembly and compose_scene_canvas</a><br><a href="https://github.com/sebi06/napari-virtual-reader/blob/main/src/napari_virtual_reader/_reader.py">_reader.py: scene compatibility, canvas eligibility and residual warnings</a><br><a href="https://github.com/sebi06/napari-virtual-reader/blob/main/src/napari_virtual_reader/_widget.py">_widget.py: native S controls and original-scene restoration</a><br><a href="https://github.com/sebi06/napari-virtual-reader/blob/main/tests/test_czi_mosaic.py">Tile tests: native pixels, overlap, gaps, lazy reads, odd extents and errors</a><br><a href="https://github.com/sebi06/napari-virtual-reader/blob/main/tests/test_widget.py">Scene tests: compact canvas, RGB, pyramids, sparse overviews and mode round-trips</a><br><a href="https://github.com/d-v-b/refkv/blob/main/spec/zarrify/czi.md">refkv CZI profile: factors, placement and calibration</a><br><a href="https://github.com/sebi06/napari-virtual-reader/blob/main/_docs/czi-tile-assembly.mmd">Editable Mermaid tile-path diagram</a></p>
 <p>Diagrams are schematic, not tissue images or performance measurements. <a href="plugin-workflow.html">Return to the general plugin workflow.</a></p>
 </section>
 </main>

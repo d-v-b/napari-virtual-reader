@@ -14,9 +14,31 @@ is recorded separately from the release preparation date.
   nonmatching scene sizes, scales, dtypes and pyramid depths without padding,
   resampling, or reopening the file. Scene switching fits the camera and keeps
   channels and metadata together, with independent controls per source load.
-- GUI reader/opener loads retain individual scenes for these controls.
-  Scripted readers keep compatible S stacks by default; `stack_scenes=False`
+- Compatible CZI scenes now open as one lazy S-stack layer per acquisition
+  channel, with napari's native scene slider, instead of many separate layers.
+  Both the opener and File/Open compact layers before insertion. The dock
+  switches between the native S stack and the spatial canvas without reopening;
+  incompatible scenes retain the separate-layer dock slider.
+- Matching 2D scenes also keep one layer per channel in **One canvas**, using
+  lazy, chunk-local spatial composition instead of expanding to one layer per
+  scene. Preserve the original arrays for S-stack restoration. Sparse canvases
+  gain lazy overview levels to avoid allocating their full spatial extent.
+  Gaps are zero and later numeric scenes win overlaps; fractional positions
+  use nearest-neighbour sampling. Nonmatching or unsupported geometries retain
+  separate layers.
+- Added a synchronized, 1-based scene-number field with up/down arrows, keyboard
+  controls and direct entry beside the dock slider. It also controls native S
+  stacks, without duplicating napari's slider.
+- Scripted readers keep compatible S stacks by default; `stack_scenes=False`
   requests individual scenes.
+
+### Changed
+
+- Updated both README-linked visual guides and their index for native scene
+  navigation, scene-number arrows, compact canvases and lazy display overviews.
+- Simplified channel grouping, scene restoration and canvas-pyramid preparation.
+  Centralized metadata refresh batching and documented coordinate conventions,
+  lazy overview sampling and reversible scene state, preserving viewing behavior.
 
 ## 0.0.3 - 2026-11-21
 

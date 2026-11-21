@@ -6,6 +6,7 @@ the irregular tiles those levels cannot represent:
 * ``_Piece`` describes one source rectangle for one acquisition channel.
 * ``_Mosaic`` exposes one resolution as an array that Dask reads in small chunks.
 * ``assemble_czi_layers`` combines the sources and replaces each supported layer.
+* ``compose_scene_canvas`` uses the same chunk reader for matching scene layers.
 
 Placement uses native CZI pixel coordinates (x, y, width, height); array indexing
 uses (y, x), with an optional trailing RGB(A) axis. Physical units are applied
@@ -97,6 +98,8 @@ class _Piece:
     An empty ``order`` means scalar pixels; otherwise it selects stored colour
     components in RGB(A) order. ``factor`` classifies the pyramid level, while
     width/height and the source shape determine the actual sampling pitch.
+    Raw refkv arrays use YX or CYX; prepared scenes use YX or YXC instead.
+    ``channels_last`` distinguishes those layouts without reordering pixels.
     """
 
     array: Any
@@ -108,6 +111,12 @@ class _Piece:
     channel: int
     order: tuple[int, ...]
     has_c: bool
+    channels_last: bool = False
+
+    @property
+    def spatial_shape(self) -> tuple[int, int]:
+        """Return Y/X sizes independently of the source's colour-axis layout."""
+        return self.array.shape[:2] if self.channels_last else self.array.shape[-2:]
 
     def read(self, ys: np.ndarray, xs: np.ndarray) -> np.ndarray:
         """Read a source rectangle and select the requested rows and columns.
@@ -150,9 +159,10 @@ class _Mosaic:
     only its requested rectangle, reads intersecting pieces, and overwrites
     overlaps in source order. Concurrent tasks have separate output buffers.
 
-    ``factor`` determines the output shape, while the actual pitch comes from
-    that shape and the common bounds. ``samples`` is zero for scalar data or
-    the packed RGB(A) component count; an acquisition C already has its own layer.
+    ``factor`` determines the output shape unless ``shape`` supplies an explicit
+    Y/X size for a scene-canvas level. The actual pitch comes from that shape and
+    the common bounds. ``samples`` is zero for scalar data or the packed RGB(A)
+    component count; an acquisition C already has its own layer.
     """
 
     def __init__(
@@ -162,11 +172,12 @@ class _Mosaic:
         factor: int,
         dtype: np.dtype,
         samples: int,
+        shape: tuple[int, int] | None = None,
     ) -> None:
         self.pieces = pieces
         self.bounds = bounds
-        x, y, width, height = bounds
-        self.shape = (math.ceil(height / factor), math.ceil(width / factor))
+        _, _, width, height = bounds
+        self.shape = shape or (math.ceil(height / factor), math.ceil(width / factor))
         if samples:
             self.shape += (samples,)
         self.ndim = len(self.shape)
@@ -177,23 +188,30 @@ class _Mosaic:
         # Napari derives level transforms from shape ratios. Sample every level
         # over the same extent so those transforms also align clipped/odd edges.
         self.step = (width / self.shape[1], height / self.shape[0])
-        self.index: dict[tuple[int, int], list[int]] = defaultdict(list)
+        self.index = self._index_pieces()
+
+    def _index_pieces(self) -> dict[tuple[int, int], list[int]]:
+        """Map output-chunk bins to source pieces without reading pixels."""
+        x, y, _, _ = self.bounds
+        step_x, step_y = self.step
+        index: dict[tuple[int, int], list[int]] = defaultdict(list)
         # Index output-chunk bins, not individual pixels. Conservative rounded
         # bounds can include extra candidates; the read path checks exact coverage.
-        for i, piece in enumerate(pieces):
+        for piece_index, piece in enumerate(self.pieces):
             # Clip bin coverage to the canvas: coarse source footprints can
             # extend beyond the finest-level bounds without enlarging the view.
-            left = max(0, math.floor((piece.x - x) / self.step[0]))
-            top = max(0, math.floor((piece.y - y) / self.step[1]))
+            left = max(0, math.floor((piece.x - x) / step_x))
+            top = max(0, math.floor((piece.y - y) / step_y))
             right = min(
-                self.shape[1], math.ceil((piece.x + piece.width - x) / self.step[0])
+                self.shape[1], math.ceil((piece.x + piece.width - x) / step_x)
             )
             bottom = min(
-                self.shape[0], math.ceil((piece.y + piece.height - y) / self.step[1])
+                self.shape[0], math.ceil((piece.y + piece.height - y) / step_y)
             )
             for row in range(top // _CHUNK_EDGE, math.ceil(bottom / _CHUNK_EDGE)):
                 for col in range(left // _CHUNK_EDGE, math.ceil(right / _CHUNK_EDGE)):
-                    self.index[row, col].append(i)
+                    index[row, col].append(piece_index)
+        return index
 
     def __getitem__(self, selection: tuple[slice, ...]) -> np.ndarray:
         """Compose the basic slices passed by Dask, retaining zero-filled gaps.
@@ -230,10 +248,10 @@ class _Mosaic:
         for index in sorted(candidates):
             piece = self.pieces[index]
             output_x, source_x = _sample_axis(
-                world_x, piece.x, piece.width, piece.array.shape[-1]
+                world_x, piece.x, piece.width, piece.spatial_shape[1]
             )
             output_y, source_y = _sample_axis(
-                world_y, piece.y, piece.height, piece.array.shape[-2]
+                world_y, piece.y, piece.height, piece.spatial_shape[0]
             )
             if not len(output_x) or not len(output_y):
                 continue
@@ -252,6 +270,68 @@ class _Mosaic:
             name=f"czi-mosaic-{uuid4().hex}",
             meta=np.empty((0,) * self.ndim, dtype=self.dtype),
         )
+
+
+def compose_scene_canvas(
+    scene_levels: list[list[da.Array]],
+    origins: np.ndarray,
+    scale: np.ndarray,
+    *,
+    rgb: bool,
+) -> tuple[list[da.Array], tuple[float, float]]:
+    """Build a lazy canvas pyramid and its physical Y/X origin.
+
+    The caller has already checked that scenes share shapes, dtype, calibration
+    and pyramid depth. ``scene_levels`` contains one pyramid per scene; origins
+    and scale use physical Y/X units. Pieces use X/Y native-pixel coordinates.
+    """
+    origin = origins.min(axis=0)
+    offsets = (origins - origin) / scale
+    scene_size = np.asarray(scene_levels[0][0].shape[:2])
+    extent = (offsets + scene_size).max(axis=0)
+    # Avoid an extra pixel caused only by calibration rounding near an integer.
+    rounded_extent = np.rint(extent)
+    near_integer = np.isclose(extent, rounded_extent, rtol=0, atol=1e-7)
+    extent = np.ceil(np.where(near_integer, rounded_extent, extent))
+
+    # Transpose scenes-by-levels into levels-by-scenes, keeping each output
+    # shape with its sources so the two cannot get out of sync.
+    pyramid = []
+    for resolution in zip(*scene_levels):
+        downsampling = scene_size / np.asarray(resolution[0].shape[:2])
+        shape = tuple(int(np.ceil(length)) for length in extent / downsampling)
+        pyramid.append((resolution, shape))
+    # A sparse plate can span gigabytes even when its scenes are tiny. Reuse
+    # the coarsest stored sources to sample overviews, not a dense fine canvas.
+    while max(pyramid[-1][1]) > _CHUNK_EDGE:
+        resolution, shape = pyramid[-1]
+        overview_shape = tuple((length + 1) // 2 for length in shape)
+        pyramid.append((resolution, overview_shape))
+
+    samples = scene_levels[0][0].shape[-1] if rgb else 0
+    bounds = (0, 0, float(extent[1]), float(extent[0]))
+    canvases = []
+    for resolution, shape in pyramid:
+        pieces = [
+            _Piece(
+                array=array,
+                x=float(offset[1]),
+                y=float(offset[0]),
+                width=float(scene_size[1]),
+                height=float(scene_size[0]),
+                factor=1,
+                channel=0,
+                order=(),
+                has_c=False,
+                channels_last=True,
+            )
+            for array, offset in zip(resolution, offsets)
+        ]
+        canvas = _Mosaic(
+            pieces, bounds, 1, resolution[0].dtype, samples, shape=shape,
+        )
+        canvases.append(canvas.lazy())
+    return canvases, (origin[0], origin[1])
 
 
 def assemble_czi_layers(
@@ -328,7 +408,7 @@ def assemble_czi_layers(
             != 1
         ):
             continue
-        c0 = min(p["planes"]["c"] for _, _, p, _, _ in matching)
+        first_channel = min(p["planes"]["c"] for _, _, p, _, _ in matching)
         channel = metadata["channel"]
         factors = image_factors[int(series)]
         multiscale = metadata["ome"]["multiscales"][0]
@@ -340,7 +420,8 @@ def assemble_czi_layers(
         base_factor = factors[0][0]
         # The original layer may start at an overview, not at native resolution.
         # Undo its downsampling to recover physical units per native pixel.
-        px, py = kwargs["scale"][1] / base_factor, kwargs["scale"][0] / base_factor
+        pixel_size_x = kwargs["scale"][1] / base_factor
+        pixel_size_y = kwargs["scale"][0] / base_factor
         pieces: dict[int, list[_Piece]] = defaultdict(list)
         dtype = group[datasets[0]["path"]].dtype
         samples = len(metadata.get("color_components", ""))
@@ -366,8 +447,8 @@ def assemble_czi_layers(
             translation = translations[0]
             # refkv translates the centre of a downsampled pixel by (F - 1)/2
             # native pixels. Reverse that offset before placing its rectangle.
-            x = translation[axes.index("x")] / px - (factor - 1) / 2
-            y = translation[axes.index("y")] / py - (factor - 1) / 2
+            x = translation[axes.index("x")] / pixel_size_x - (factor - 1) / 2
+            y = translation[axes.index("y")] / pixel_size_y - (factor - 1) / 2
             if not np.allclose((x, y), (round(x), round(y)), rtol=0, atol=1e-6):
                 raise ValueError(
                     f"CZI series {series} has a non-integral native origin"
@@ -401,7 +482,7 @@ def assemble_czi_layers(
             tile_channels[name] = count
             # CZI plane indexes can start above zero. Convert the layer's
             # relative acquisition channel to this particular tile's C offset.
-            tile_channel = c0 + channel - placement["planes"]["c"]
+            tile_channel = first_channel + channel - placement["planes"]["c"]
             # Do not cast dtype or invent missing components to force a match.
             # An incompatible tile/channel remains visible in the warning count.
             if (
@@ -442,12 +523,12 @@ def assemble_czi_layers(
         # Napari expects transforms for the finest displayed level. Keep the
         # same pixel-centre convention even when native resolution is absent.
         kwargs["scale"] = (
-            py * height / pyramids[0].shape[0],
-            px * width / pyramids[0].shape[1],
+            pixel_size_y * height / pyramids[0].shape[0],
+            pixel_size_x * width / pyramids[0].shape[1],
         )
         kwargs["translate"] = (
-            py * (y0 + (height / pyramids[0].shape[0] - 1) / 2),
-            px * (x0 + (width / pyramids[0].shape[1] - 1) / 2),
+            pixel_size_y * (y0 + (height / pyramids[0].shape[0] - 1) / 2),
+            pixel_size_x * (x0 + (width / pyramids[0].shape[1] - 1) / 2),
         )
         metadata["czi_assembly"] = {
             "bounds": bounds,

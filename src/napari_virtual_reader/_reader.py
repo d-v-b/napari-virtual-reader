@@ -13,7 +13,6 @@ receives a separate snapshot of the original store, not the displayed mosaic.
 import os
 import sys
 from collections.abc import Iterator
-from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -21,6 +20,8 @@ from uuid import uuid4
 
 import dask.array as da
 import numpy as np
+
+LayerData = tuple[Any, dict, str]
 
 # Keep this offer-to-read list aligned with napari.yaml's filename_patterns.
 # A suffix selects this reader; refkv and the OME metadata decide actual support.
@@ -154,22 +155,33 @@ def _czi_rgb_order(array: Any, channel_axis: int) -> tuple[int, ...]:
     return (2, 1, 0, 3) if samples == 4 else (2, 1, 0)
 
 
-def _stack_czi_scenes(
-    layers: list[tuple[Any, dict, str]], source: Path
-) -> list[tuple[Any, dict, str]]:
+def _group_by_channel(layers: list[LayerData]) -> dict[tuple[int, int, bool], list[LayerData]]:
+    """Keep acquisition channels and multiscale series separate within a load."""
+    channels = {}
+    for layer in layers:
+        kwargs = layer[1]
+        metadata = kwargs["metadata"]
+        key = (metadata["multiscale_index"], metadata["channel"], kwargs["rgb"])
+        channels.setdefault(key, []).append(layer)
+    return channels
+
+
+def _scene_metadata(kwargs: dict) -> dict:
+    """Keep per-scene provenance without duplicating the shared source tree."""
+    metadata = dict(kwargs["metadata"])
+    metadata.pop("zarr_structure", None)
+    return {**metadata, "scale": kwargs["scale"], "translate": kwargs["translate"]}
+
+
+def _stack_czi_scenes(layers: list[LayerData], source: Path) -> list[LayerData]:
     """Stack compatible CZI series per channel while retaining scene provenance.
 
     This is a scene selector, not spatial stitching: every scene keeps its pixels
     and must fit the same axes, scale, shape, dtype and pyramid structure. A lazy
     stack adds S in front of each level; incompatible scene groups stay separate.
     """
-    channels = {}
-    for layer in layers:
-        metadata = layer[1]["metadata"]
-        key = (metadata["multiscale_index"], metadata["channel"], layer[1]["rgb"])
-        channels.setdefault(key, []).append(layer)
     result = []
-    for scenes in channels.values():
+    for scenes in _group_by_channel(layers).values():
         first = scenes[0][1]
         levels = [
             data if kwargs["multiscale"] else [data] for data, kwargs, _ in scenes
@@ -196,14 +208,7 @@ def _stack_czi_scenes(
         stacked = [da.stack(level, axis=0) for level in zip(*levels)]
         metadata = {
             **first["metadata"],
-            "scenes": [
-                {
-                    **kwargs["metadata"],
-                    "scale": kwargs["scale"],
-                    "translate": kwargs["translate"],
-                }
-                for _, kwargs, _ in scenes
-            ],
+            "scenes": [_scene_metadata(kwargs) for _, kwargs, _ in scenes],
         }
         # One napari layer has one transform. Retain origins shared by all
         # scenes; use zero only on axes whose origins differ. The scenes list
@@ -222,7 +227,100 @@ def _stack_czi_scenes(
             ),
             "metadata": metadata,
         }
+        if "units" in first:
+            kwargs["units"] = ("pixel",) + tuple(first["units"])
         result.append((stacked if first["multiscale"] else stacked[0], kwargs, "image"))
+    return result
+
+
+def _compact_czi_layers(layers: list[LayerData]) -> list[LayerData]:
+    """Use native S stacks only when the complete source has matching scenes."""
+    groups = {}
+    for layer in layers:
+        load_id = layer[1].get("metadata", {}).get("czi_load_id")
+        groups.setdefault(load_id, []).append(layer)
+    result = []
+    for load_id, scenes in groups.items():
+        if load_id is None:
+            result.extend(scenes)
+            continue
+        # A stack has one visibility setting per channel, not per scene.
+        channel_groups = _group_by_channel(scenes)
+        if any(
+            len({kwargs.get("visible", True) for _, kwargs, _ in channel}) > 1
+            for channel in channel_groups.values()
+        ):
+            result.extend(scenes)
+            continue
+        stacked = _stack_czi_scenes(scenes, Path(scenes[0][1]["metadata"]["source"]))
+        scene_ids = [
+            [scene["series"] for scene in kwargs["metadata"].get("scenes", [])]
+            for _, kwargs, _ in stacked
+        ]
+        # Do not partially stack a load: every channel needs the same S axis.
+        if scene_ids and all(ids and ids == scene_ids[0] for ids in scene_ids):
+            result.extend(stacked)
+        else:
+            result.extend(scenes)
+    return result
+
+
+def _read_gui_images(path: str | list[str]) -> list[LayerData]:
+    return _compact_czi_layers(read_images(path, stack_scenes=False))
+
+
+def _canvas_czi_layers(layers: list[LayerData]) -> list[LayerData]:
+    """Compose matching 2D scenes in bounded chunks, retaining their footprints."""
+    from ._czi_mosaic import compose_scene_canvas
+
+    compact = _compact_czi_layers(layers)
+    if not compact or any(
+        "scenes" not in kwargs["metadata"]
+        or tuple(kwargs["axis_labels"]) != ("S", "y", "x")
+        for _, kwargs, _ in compact
+    ):
+        return layers
+    result = []
+    for _, stacked_kwargs, _ in compact:
+        metadata = stacked_kwargs["metadata"]
+        scenes = [
+            layer for layer in layers
+            if layer[1]["metadata"]["channel"] == metadata["channel"]
+            and layer[1]["metadata"]["multiscale_index"] == metadata["multiscale_index"]
+        ]
+        first = scenes[0][1]
+        # A rotated scene cannot be placed by an axis-aligned source rectangle.
+        if any(
+            not np.allclose(kwargs.get("rotate", np.eye(2)), np.eye(2))
+            or not np.allclose(kwargs.get("shear", 0), 0)
+            or (
+                "affine" in kwargs
+                and not np.allclose(kwargs["affine"].linear_matrix, np.eye(2))
+            )
+            for _, kwargs, _ in scenes
+        ):
+            return layers
+        scene_levels = [
+            data if kwargs["multiscale"] else [data] for data, kwargs, _ in scenes
+        ]
+        canvases, origin = compose_scene_canvas(
+            scene_levels,
+            origins=np.asarray([kwargs["translate"] for _, kwargs, _ in scenes]),
+            scale=np.asarray(first["scale"]),
+            rgb=first["rgb"],
+        )
+        result.append((
+            canvases if len(canvases) > 1 else canvases[0],
+            {
+                **first, "name": stacked_kwargs["name"],
+                "multiscale": len(canvases) > 1,
+                "translate": origin,
+                "metadata": {
+                    **stacked_kwargs["metadata"], "czi_scene_canvas": True,
+                },
+            },
+            "image",
+        ))
     return result
 
 
@@ -253,7 +351,7 @@ def _zarr_structure(group: Any) -> dict:
 def _layers(
     root: Any, source: Path, czi_image_factors: list | None = None,
     *, stack_scenes: bool = True,
-) -> list[tuple[Any, dict, str]]:
+) -> list[LayerData]:
     """Translate OME axes, stored pyramids, transforms and channels to layers.
 
     First build ordinary per-channel image layers. Then assemble eligible CZI
@@ -261,8 +359,8 @@ def _layers(
     All array slicing, transposition and stacking in preparation remain lazy.
     ``czi_image_factors`` is raw refkv calibration data, not a request to create
     additional pyramid resolutions.
-    GUI callers disable ``stack_scenes`` so each scene retains its own shape,
-    transform and pyramid for the dock's canvas/slider controls.
+    GUI callers prepare individual scenes, then compact the complete source
+    when every channel supports the same native scene axis.
     """
     from napari.utils.colormaps import Colormap
 
@@ -333,16 +431,15 @@ def _layers(
                 # Slice the packed components together, or index away the one
                 # scalar C axis. Both paths yield one layer per acquisition C.
                 component_start = channel_index * samples
-                selection = tuple(
-                    (
+                selection: list[slice | int] = [slice(None)] * len(axes)
+                if channel_axis is not None:
+                    selection[channel_axis] = (
                         slice(component_start, component_start + samples)
                         if is_rgb else channel_index
                     )
-                    if axis == "c" else slice(None)
-                    for axis in axes
-                )
                 levels = [
-                    level[selection].transpose(permutation) for level in lazy_levels
+                    level[tuple(selection)].transpose(permutation)
+                    for level in lazy_levels
                 ]
                 if is_rgb:
                     levels = [
@@ -453,7 +550,7 @@ def _layers(
 
 def read_images(
     path: str | list[str], *, stack_scenes: bool = True,
-) -> list[tuple[Any, dict, str]]:
+) -> list[LayerData]:
     """Open local images or VZIP archives as lazy virtual OME-Zarr layers.
 
     Args:
@@ -503,7 +600,7 @@ def read_images(
 def read_and_save_image(
     path: str, archive_path: str, *, overwrite: bool = False,
     stack_scenes: bool = True,
-) -> list[tuple[Any, dict, str]]:
+) -> list[LayerData]:
     """Prepare lazy layers and atomically save their reference archive, not pixels.
 
     Args:
@@ -585,5 +682,5 @@ def napari_get_reader(path: str | list[str]):
             from ._metadata import prepare_metadata_inspectors
 
             prepare_metadata_inspectors()
-        return partial(read_images, stack_scenes=False)
+        return _read_gui_images
     return None

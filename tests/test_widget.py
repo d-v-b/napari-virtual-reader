@@ -220,7 +220,7 @@ def test_save_dialog_cancellation_and_replacement(tmp_path, qtbot, monkeypatch, 
     assert output.read_bytes() == b"existing archive"
 
 
-@pytest.mark.parametrize("difference", ["matching", "shape", "scale", "dtype", "levels"])
+@pytest.mark.parametrize("difference", ["shape", "scale", "dtype", "levels", "visibility"])
 def test_scene_slider_and_canvas_keep_independent_scene_data(
     qtbot, make_napari_viewer, difference,
 ):
@@ -265,11 +265,17 @@ def test_scene_slider_and_canvas_keep_independent_scene_data(
     assert [layer.visible for layer in layers] == [True, False, False, False]
     np.testing.assert_allclose(viewer.scene.camera.center[-2:], (20.7, 40.9))
     widget.scene_slider.setValue(1)
+    assert widget.scene_number.value() == 2
     assert "series 10" in widget.scene_label.text()
     assert [layer.visible for layer in layers] == [False, False, True, True]
     assert viewer.layers.selection.active is layers[2]
     assert widget.metadata_panel.source.text() == "scenes.czi"
     assert unrelated.visible
+    widget.scene_number.stepDown()
+    assert widget.scene_slider.value() == 0
+    assert [layer.visible for layer in layers] == [True, False, False, False]
+    widget.scene_number.stepUp()
+    assert widget.scene_slider.value() == 1
     layers[3].visible = False
     widget.scene_slider.setValue(0)
     widget.scene_slider.setValue(1)
@@ -283,10 +289,15 @@ def test_scene_slider_and_canvas_keep_independent_scene_data(
     assert unrelated.visible
     # Removing the selected scene clamps the slider and restores its remaining scene.
     widget.scene_mode.setCurrentText("Scene slider")
-    viewer.layers.remove(layers[2])
-    viewer.layers.remove(layers[3])
-    assert not widget.scene_mode.isEnabled()
-    assert layers[0].visible
+    if difference == "visibility":
+        # Visibility now matches across scenes, so native stacking is possible.
+        assert len(viewer.layers) == 3  # Unrelated image and two channels.
+        assert widget.scene_slider.isHidden()
+    else:
+        viewer.layers.remove(layers[2])
+        viewer.layers.remove(layers[3])
+        assert not widget.scene_mode.isEnabled()
+        assert layers[0].visible
 
 
 def test_scene_controls_isolate_repeated_source_loads(qtbot, make_napari_viewer):
@@ -296,7 +307,7 @@ def test_scene_controls_isolate_repeated_source_loads(qtbot, make_napari_viewer)
     root.attrs["refkv_zarrified"] = {"profile": "czi"}
     for scene in (0, 1):
         group = root.create_group(str(scene))
-        group.create_array("0", data=np.full((8, 10), scene, dtype="uint16"))
+        group.create_array("0", data=np.full((8 + scene, 10), scene, dtype="uint16"))
         group.attrs["ome"] = {
             "multiscales": [{"axes": ["y", "x"], "datasets": [{"path": "0"}]}],
         }
@@ -314,3 +325,193 @@ def test_scene_controls_isolate_repeated_source_loads(qtbot, make_napari_viewer)
     viewer.layers.selection.active = loads[1][1]
     assert widget.scene_mode.currentText() == "Scene slider"
     assert widget.scene_slider.value() == 1
+
+
+@pytest.mark.parametrize("rgb", [False, True])
+@pytest.mark.parametrize("multiscale", [False, True])
+def test_matching_scenes_use_native_axis_and_canvas_roundtrip(
+    qtbot, make_napari_viewer, monkeypatch, rgb, multiscale,
+):
+    """Compact before insertion and keep arrows, native S and canvas in sync."""
+    from napari_virtual_reader._reader import _compact_czi_layers, _read_gui_images
+
+    viewer = make_napari_viewer()
+    _, widget = viewer.window.add_plugin_dock_widget("napari-virtual-reader")
+    root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
+    root.attrs["refkv_zarrified"] = {"profile": "czi"}
+    for scene in (2, 10):
+        group = root.create_group(str(scene))
+        data = np.full((2, 8, 10), scene, dtype="uint16")
+        group.create_array("0", data=data, chunks=(1, 4, 5))
+        datasets = [{
+            "path": "0",
+            "coordinateTransformations": [
+                {"type": "scale", "scale": [1, 0.2, 0.2]},
+                {"type": "translation", "translation": [0, scene * 10, 40 + scene * 0.2]},
+            ],
+        }]
+        if multiscale:
+            group.create_array("1", data=data[:, ::2, ::2], chunks=(1, 2, 3))
+            datasets.append({"path": "1"})
+        group.attrs["ome"] = {
+            "multiscales": [{"axes": ["c", "y", "x"], "datasets": datasets}],
+        }
+    prepared = _layers(root, Path("scenes.czi"), stack_scenes=False)
+    if rgb:
+        # Packed colour is already decoded and ordered by the reader.
+        prepared = [
+            (
+                [da.stack([level] * 3, axis=-1) for level in data]
+                if multiscale else da.stack([data] * 3, axis=-1),
+                {**kwargs, "rgb": True}, kind,
+            )
+            for data, kwargs, kind in prepared
+        ]
+    monkeypatch.setattr(
+        "napari_virtual_reader._reader.read_images",
+        lambda path, **kwargs: prepared,
+    )
+    compact = _read_gui_images("scenes.czi")
+    assert len(compact) == 2
+    for _, kwargs, _ in compact:
+        assert kwargs["metadata"]["zarr_structure"] is prepared[0][1]["metadata"]["zarr_structure"]
+        assert all("zarr_structure" not in scene for scene in kwargs["metadata"]["scenes"])
+    incomplete = _compact_czi_layers(prepared[:-1])
+    assert len(incomplete) == len(prepared) - 1
+    assert all("scenes" not in kwargs["metadata"] for _, kwargs, _ in incomplete)
+    # The opener and File/Open must both compact before adding viewer layers.
+    inserted = []
+    viewer.layers.events.inserted.connect(lambda event: inserted.append(event.value))
+    widget._loaded(prepared)
+    assert len(viewer.layers) == len(inserted) == 2
+    assert widget.scene_mode.currentText() == "Scene slider"
+    assert widget.scene_slider.isHidden()
+    assert widget.scene_number.isEnabled()
+    for layer in viewer.layers:
+        assert layer.axis_labels == ("S", "y", "x")
+        finest = layer.data[0] if multiscale else layer.data
+        assert finest.shape[:3] == (2, 8, 10)
+    widget.scene_number.stepUp()
+    assert viewer.dims.current_step[0] == 1
+    viewer.dims.set_current_step(0, 0)
+    assert widget.scene_number.value() == 1
+    viewer.dims.set_current_step(0, 1)
+    assert widget.scene_number.value() == 2
+    for channel, layer in enumerate(viewer.layers):
+        layer.gamma = 1.4
+        layer.opacity = 0.6
+        layer.contrast_limits = (0, 20)
+        layer.visible = channel == 0
+    set_metadata = Mock(wraps=widget.metadata_panel.set_layer)
+    monkeypatch.setattr(widget.metadata_panel, "set_layer", set_metadata)
+    widget.scene_mode.setCurrentText("One canvas")
+    set_metadata.assert_called_once()
+    assert len(viewer.layers) == 2
+    assert viewer.dims.ndim == 2
+    for layer in viewer.layers:
+        np.testing.assert_allclose(layer.translate, (20, 40.4))
+        assert layer.gamma == 1.4
+        assert layer.opacity == 0.6
+        assert layer.visible == (layer.metadata["channel"] == 0)
+        levels = layer.data if multiscale else [layer.data]
+        for index, level in enumerate(levels):
+            factor = 2 ** index
+            pixels = level.compute()
+            np.testing.assert_array_equal(pixels[:8 // factor, :10 // factor], 2)
+            np.testing.assert_array_equal(
+                pixels[400 // factor:408 // factor, 8 // factor:18 // factor], 10,
+            )
+            assert not pixels[100 // factor, 0].any()
+    widget.scene_mode.setCurrentText("Scene slider")
+    assert len(viewer.layers) == 2
+    assert viewer.dims.ndim == 3
+    assert viewer.dims.current_step[0] == 1
+    for layer in viewer.layers:
+        assert layer.gamma == 1.4
+        assert layer.opacity == 0.6
+        levels = layer.data if multiscale else [layer.data]
+        for level in levels:
+            np.testing.assert_array_equal(level[0].compute(), 2)
+            np.testing.assert_array_equal(level[1].compute(), 10)
+    widget.scene_number.stepDown()
+    assert viewer.dims.current_step[0] == 0
+    qtbot.keyClick(widget.scene_number, Qt.Key.Key_Up)
+    assert viewer.dims.current_step[0] == 1
+    qtbot.keyClick(widget.scene_number, Qt.Key.Key_Down)
+    assert viewer.dims.current_step[0] == 0
+    # More than one round trip also exercises transforms serialized by napari.
+    widget.scene_mode.setCurrentText("One canvas")
+    assert len(viewer.layers) == 2
+    widget.scene_mode.setCurrentText("Scene slider")
+    assert len(viewer.layers) == 2
+
+
+def test_sparse_scene_canvas_has_lazy_overviews_and_bounded_reads():
+    from dask import delayed
+
+    from napari_virtual_reader._reader import _canvas_czi_layers
+
+    reads = []
+
+    @delayed
+    def pixels(value):
+        reads.append(value)
+        return np.full((8, 10), value, dtype="uint16")
+
+    layers = []
+    for scene, x in enumerate((0, 5, 100000)):
+        layers.append((
+            da.from_delayed(pixels(scene + 1), shape=(8, 10), dtype="uint16"),
+            {
+                "axis_labels": ("y", "x"), "scale": (1, 1),
+                "translate": (0, x), "rgb": False, "multiscale": False,
+                "metadata": {
+                    "source": "sparse.czi", "czi_load_id": "sparse",
+                    "series": str(scene), "channel": 0, "channel_label": "C0",
+                    "multiscale_index": 0,
+                },
+            },
+            "image",
+        ))
+    [(levels, kwargs, _)] = _canvas_czi_layers(layers)
+    assert not reads
+    assert kwargs["multiscale"]
+    assert levels[0].shape == (8, 100010)
+    assert max(levels[-1].shape) <= 1024
+    assert levels[0].chunksize == (8, 1024)
+    np.testing.assert_array_equal(levels[0][:, :5].compute(), 1)
+    assert set(reads) == {1, 2}  # Only scenes intersecting this output chunk.
+    reads.clear()
+    np.testing.assert_array_equal(levels[0][:, 5:10].compute(), 2)
+    assert set(reads) == {1, 2}  # Later numeric scene wins overlaps.
+    reads.clear()
+    assert not levels[0][:, 2000:2010].compute().any()
+    assert not reads
+    assert levels[-1].compute().shape == levels[-1].shape
+
+
+@pytest.mark.parametrize("geometry", ["volume", "rotation"])
+def test_scene_canvas_retains_layers_for_unsupported_geometry(geometry):
+    from napari_virtual_reader._reader import _canvas_czi_layers
+
+    volume = geometry == "volume"
+    layers = [
+        (
+            da.zeros((2, 8, 10) if volume else (8, 10), dtype="uint16"),
+            {
+                "axis_labels": ("z", "y", "x") if volume else ("y", "x"),
+                "scale": (1, 1, 1) if volume else (1, 1),
+                "translate": (0, 0, index * 10) if volume else (0, index * 10),
+                **({} if volume else {"rotate": np.array([[0, -1], [1, 0]])}),
+                "rgb": False, "multiscale": False,
+                "metadata": {
+                    "source": "scenes.czi", "czi_load_id": "geometry",
+                    "series": str(index), "channel": 0, "channel_label": "C0",
+                    "multiscale_index": 0,
+                },
+            },
+            "image",
+        )
+        for index in range(2)
+    ]
+    assert _canvas_czi_layers(layers) is layers

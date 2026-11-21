@@ -18,13 +18,14 @@
 </style>
 </head>
 <body>
-<nav class="ve-toc" aria-label="Sections"><div><a href="#idea">Idea</a><a href="#route">Open path</a><a href="#dock">Dock</a><a href="#archive">VZIP</a><a href="#scope">Limits</a></div><span class="pos"></span></nav>
+<nav class="ve-toc" aria-label="Sections"><div><a href="#idea">Idea</a><a href="#route">Open path</a><a href="#dock">Dock</a><a href="#scenes">Scenes</a><a href="#archive">VZIP</a><a href="#scope">Limits</a></div><span class="pos"></span></nav>
 <main>
 <header id="idea">
 <div class="home-links"><a href="index.html">Visual guides</a><a href="czi-tile-assembly.html">CZI tile assembly</a><a href="https://github.com/sebi06/napari-virtual-reader">Repository</a></div>
 <p class="eyebrow">napari-virtual-reader / general workflow</p>
 <h1>Keep the pixels in the original file.</h1>
 <p class="lead">Build a virtual OME-Zarr view, then decode source regions when napari requests them.</p>
+<p class="meta">Source-checkout guide / includes unreleased scene controls.</p>
 </header>
 <figure class="ve-steps">
 <div class="frame"><svg class="ve-svg" viewBox="0 0 880 340" role="img" aria-label="Preparation builds references and lazy layers; viewing reads source bytes through those references.">
@@ -66,14 +67,14 @@ flowchart TD
 </pre></div>
 <figcaption><span class="fig-n">Fig. 2</span>Only a raw CZI supplies the live calibration summary used for new tile assembly.</figcaption>
 </figure>
-<p>The reader discovers OME-Zarr image groups, maps axes and transforms, and creates a layer per acquisition channel. It preserves stored pyramid levels. It does not create missing resolution levels by downsampling.</p>
+<p>The reader maps OME image groups, axes and transforms into lazy layers. Tile assembly recovers stored levels without inventing missing tile resolutions. A separate scene-canvas path can add lazy display overviews.</p>
 <h3>Why CZI needs an extra path</h3>
 <p>refkv can expose irregular or overlapping CZI tiles separately from its regular image levels. Reading only those levels can omit native resolution or show just an overview.</p>
 <p>The CZI assembler uses tile coordinates and resolution factors to expose those pieces as aligned image levels. Placement restores the missing view; lazy chunk reads avoid materializing the whole slide. Laziness alone does not solve tile placement.</p>
 <div class="boundary-note"><strong>CZI-only assembly.</strong> Other formats bypass this extra path. They can still display images and pyramids already exposed by refkv, but this plugin does not yet assemble their separate irregular tile arrays.</div>
 <div class="split">
 <div><h3>Colour is not a channel count</h3><p>CZI packed BGR(A) samples become one RGB(A) layer. Codec-aware ordering retains already-decoded RGB. Scalar fluorescence channels stay separate.</p></div>
-<div><h3>Scenes can share a slider</h3><p>Compatible CZI scenes stack along <code>S</code>. Different shapes, scales, dtypes, axes or level counts stay separate. Original scene transforms remain in metadata.</p></div>
+<div><h3>Matching scenes share a layer</h3><p>Compatible CZI scenes open on a native <code>S</code> axis. Matching 2D scenes also share one spatial canvas per channel. Other geometries retain separate scene layers.</p></div>
 </div>
 <p>Registered filename extensions offer the reader; they do not guarantee that refkv can parse the file or decode its codecs.</p>
 </section>
@@ -87,6 +88,9 @@ flowchart TD
 <div class="control">[ ] Save VZIP archive</div>
 <div class="control">Open</div>
 <p class="ve-label">Progress and status</p>
+<div class="control">CZI scenes: One canvas / Scene slider</div>
+<div class="control">Scene number: type or use up/down arrows</div>
+<p class="ve-label">Native S stack: napari slider + dock number.<br>Separate scenes: dock slider + number.</p>
 <div class="inspector"><h3>Selected layer metadata</h3><p>Zarr structure / Metadata</p><div class="control">Filter properties</div><pre>source
 series / channel
 ome
@@ -107,6 +111,43 @@ reader_warning (when present)</pre></div>
 </figure>
 <p>The Zarr tree describes the original reference store. For an assembled CZI, the displayed mosaic can have different shapes and levels; inspect <code>czi_assembly</code> as well.</p>
 </section>
+<section id="scenes">
+<div class="sec-head"><p class="ve-label caps">Scene display</p><h2>Matching scenes keep one layer in both modes.</h2></div>
+<figure>
+<div class="frame"><svg class="ve-svg" viewBox="0 0 900 390" role="img" aria-label="One channel with 28 matching scenes keeps one layer in native S mode and one layer in spatial canvas mode; nonmatching scenes retain separate layers.">
+<text class="ve-tag" x="30" y="32">MATCHING / SCENE SLIDER</text>
+<text class="ve-tag" x="335" y="32">MATCHING / ONE CANVAS</text>
+<text class="ve-tag" x="635" y="32">NONMATCHING FALLBACK</text>
+<rect class="ve-bnd" x="30" y="65" width="230" height="245"/><text class="ve-bnd-t" x="44" y="86">ONE CHANNEL LAYER</text>
+<rect class="file" x="60" y="110" width="170" height="115"/><text class="ink" x="79" y="145">Selected scene</text><text class="note" x="79" y="174">S = 19</text><text class="note" x="79" y="201">original pixels</text>
+<path class="guide" d="M60 252H230"/><circle cx="176" cy="252" r="5" class="ink"/>
+<text class="note" x="60" y="285">Scene 20 / 28</text>
+<path class="ve-e" d="M270 180H325"/><text class="ve-el" x="297" y="155">switch</text>
+<rect class="ve-bnd" x="335" y="65" width="230" height="245"/><text class="ve-bnd-t" x="349" y="86">ONE CHANNEL LAYER</text>
+<g class="guide" stroke-width="1.5">
+<path d="M365 110h18v18h-18z M391 110h18v18h-18z M417 110h18v18h-18z M443 110h18v18h-18z M469 110h18v18h-18z M495 110h18v18h-18z M521 110h18v18h-18z"/>
+<path d="M365 142h18v18h-18z M391 142h18v18h-18z M417 142h18v18h-18z M443 142h18v18h-18z M469 142h18v18h-18z M495 142h18v18h-18z M521 142h18v18h-18z"/>
+<path d="M365 174h18v18h-18z M391 174h18v18h-18z M417 174h18v18h-18z M443 174h18v18h-18z M469 174h18v18h-18z M495 174h18v18h-18z M521 174h18v18h-18z"/>
+<path d="M365 206h18v18h-18z M391 206h18v18h-18z M417 206h18v18h-18z M443 206h18v18h-18z M469 206h18v18h-18z M495 206h18v18h-18z M521 206h18v18h-18z"/>
+</g>
+<text class="note" x="365" y="256">All scene positions</text><text class="note" x="365" y="283">lazy chunks + overviews</text>
+<g class="ve-dim"><path class="ext" d="M365 318V345M539 318V345"/><path class="ln" d="M365 337H539M361 341l8-8M535 341l8-8"/><text x="452" y="331">28 scene footprints</text></g>
+<rect class="file" x="635" y="85" width="225" height="85"/><text class="ink" x="651" y="113">Scene A / layer</text><text class="note" x="651" y="143">original size + pyramid</text>
+<rect class="file" x="635" y="195" width="165" height="85"/><text class="ink" x="651" y="223">Scene B / layer</text><text class="note" x="651" y="253">different shape</text>
+<text class="note" x="635" y="318">Canvas: show together</text><text class="note" x="635" y="345">Dock slider: show one</text>
+<text class="note" x="30" y="378">Schematic layouts, not measured scene positions. Repeat per acquisition channel.</text>
+</svg></div>
+<figcaption><span class="fig-n">Fig. 4</span>Scene-slider and canvas modes retain one layer per channel for matching 2D scenes; incompatible scenes stay separate.</figcaption>
+</figure>
+<p>Matching scenes open with napari's native <code>S</code> slider. The dock's 1-based scene-number field supports direct entry and up/down arrows. Native S indices are 0-based; both controls stay synchronized.</p>
+<p>Switch to <strong>One canvas</strong> to see all matching 2D scenes at their recorded positions. Switch back to restore the original scene arrays, pyramid levels and selected scene. No source reopening or saved pixel copy is needed.</p>
+<div class="split">
+<div><h3>One spatial canvas when safe</h3><p>Scenes need the same axes, shape, dtype, scale, pyramid depth and channel membership. Combined canvases currently support Y/X scenes without rotation or shear. Gaps are zero; later numeric scenes win overlaps.</p></div>
+<div><h3>Separate layers when needed</h3><p>Nonmatching scenes keep their own shapes and pyramids. The dock slider and scene-number field show one scene at a time; canvas mode shows them together. Independent scene/channel visibility can also prevent stacking.</p></div>
+</div>
+<p>Large sparse canvases gain lazy nearest-neighbour overviews. Fractional scene positions also use nearest-neighbour canvas sampling. This is display composition, not registration, and it does not recover missing native data.</p>
+<p>Mode changes apply to the active source load. Native S stacks follow napari's shared dimension controls; separate-layer dock sliders retain independent scene indices.</p>
+</section>
 <section id="archive">
 <div class="sec-head"><p class="ve-label caps">Persistence</p><h2>A VZIP saves the map, not the image pixels.</h2></div>
 <figure>
@@ -119,7 +160,7 @@ reader_warning (when present)</pre></div>
 <g class="ve-n"><rect class="sh" x="650" y="50" width="190" height="70"/><text x="745" y="76">VZIP archive</text><text class="sub" x="745" y="100">optional file</text></g>
 <text class="ve-tag" x="30" y="240">Not a portable, self-contained pixel backup.</text>
 </svg></div>
-<figcaption><span class="fig-n">Fig. 4</span>Saving preserves refkv's reference layout, not the plugin's runtime CZI mosaic or live pyramid-factor summary.</figcaption>
+<figcaption><span class="fig-n">Fig. 5</span>Saving preserves refkv's reference layout, not the plugin's runtime CZI mosaic or live pyramid-factor summary.</figcaption>
 </figure>
 <p>Choose the original CZI for mosaic assembly. Reopened VZIPs may show only regular levels and warn about remaining tiles. Source access must also be permitted by refkv's policy.</p>
 <p>Saving stages the archive before publishing it. Replacing an existing destination requires confirmation; a failed write preserves the old archive. Cancelling the save dialog cancels that open action.</p>
@@ -132,7 +173,7 @@ reader_warning (when present)</pre></div>
 <div class="case" data-st="warn"><span class="chip warn">Incomplete CZI</span><h3>Unsupported tiles remain</h3><svg class="ve-mini" viewBox="0 0 260 100" role="img" aria-label="Remaining tiles are omitted and produce a warning"><rect class="ve-slot is-on" x="20" y="20" width="50" height="50"/><rect class="ve-slot" x="80" y="20" width="50" height="50"/><text class="ve-tag" x="145" y="50">Warning</text></svg></div>
 <div class="case" data-st="risk"><span class="chip risk">Explicit failure</span><h3>No supported OME image</h3><svg class="ve-mini" viewBox="0 0 260 100" role="img" aria-label="No supported OME image produces an error, not a guessed image"><path class="guide" d="M20 50H220"/><path class="guide" d="M110 30L150 70M110 70L150 30"/><text class="ve-tag" x="20" y="90">No image layer</text></svg></div>
 </div>
-<figcaption><span class="fig-n">Fig. 5</span>A pyramid alone is not evidence that native resolution or every source tile is displayed.</figcaption>
+<figcaption><span class="fig-n">Fig. 6</span>A pyramid alone is not evidence that native resolution or every source tile is displayed.</figcaption>
 </figure>
 <p>Supported 2D CZI mosaics use deterministic tile placement, not registration or blending. This plugin does not use czitools or libCZI as a fallback.</p>
 <p>The incomplete-tile warning is also CZI-specific. No warning for another format is not proof of a complete view.</p>
@@ -141,7 +182,7 @@ reader_warning (when present)</pre></div>
 </section>
 <section class="sources" aria-label="Sources">
 <p class="ve-label caps">Implementation sources</p>
-<p><a href="https://github.com/sebi06/napari-virtual-reader/blob/main/src/napari_virtual_reader/_reader.py">Reader: read_images, _layers, _stack_czi_scenes, read_and_save_image</a><br><a href="https://github.com/sebi06/napari-virtual-reader/blob/main/src/napari_virtual_reader/_widget.py">Dock: preparation worker, Qt delivery and save interaction</a><br><a href="https://github.com/sebi06/napari-virtual-reader/blob/main/src/napari_virtual_reader/_metadata.py">Metadata inspector</a><br><a href="https://github.com/sebi06/napari-virtual-reader/blob/main/_docs/plugin-workflow.mmd">Editable Mermaid diagram</a></p>
+<p><a href="https://github.com/sebi06/napari-virtual-reader/blob/main/src/napari_virtual_reader/_reader.py">Reader: read_images, scene compatibility and archive saving</a><br><a href="https://github.com/sebi06/napari-virtual-reader/blob/main/src/napari_virtual_reader/_widget.py">Dock: native S controls, scene restoration and Qt delivery</a><br><a href="https://github.com/sebi06/napari-virtual-reader/blob/main/src/napari_virtual_reader/_czi_mosaic.py">Canvas: compose_scene_canvas and chunk-local reads</a><br><a href="https://github.com/sebi06/napari-virtual-reader/blob/main/src/napari_virtual_reader/_metadata.py">Metadata inspector and batched refresh</a><br><a href="https://github.com/sebi06/napari-virtual-reader/blob/main/_docs/plugin-workflow.mmd">Editable Mermaid read-path diagram</a></p>
 <p>Describes the current implementation, not a guarantee of upstream format support. <a href="czi-tile-assembly.html">Continue with the detailed CZI assembly guide.</a></p>
 </section>
 </main>

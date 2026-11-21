@@ -4,8 +4,14 @@ These are static, standalone HTML pages. Open the rendered `.html` files in a
 browser, or read them on [GitHub Pages](https://sebi06.github.io/napari-virtual-reader/).
 GitHub's repository file viewer shows HTML source; it does not run these pages.
 
-- [Plugin workflow](plugin-workflow.html)
-- [CZI tile assembly](czi-tile-assembly.html)
+- [Plugin workflow](plugin-workflow.html): combined dock, native S navigation,
+  scene-number arrows, compact spatial canvases, metadata and VZIP archives.
+- [CZI tile assembly](czi-tile-assembly.html): native tile placement and chunk reads,
+  plus the separate scene-canvas overview path.
+
+The guides describe the current source checkout, including unreleased scene
+controls. Matching 2D scenes retain one layer per acquisition channel in both
+display modes; unsupported or nonmatching geometries retain separate layers.
 
 ## Editing and rendering
 

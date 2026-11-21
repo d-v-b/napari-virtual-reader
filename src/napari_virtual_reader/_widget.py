@@ -11,9 +11,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import napari
+import numpy as np
 from napari.layers import Image
 from napari.qt.threading import create_worker
-from qtpy.QtCore import Qt, Slot
+from napari.utils.transforms import CompositeAffine
+from qtpy.QtCore import QSignalBlocker, Qt, Slot
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -25,6 +27,7 @@ from qtpy.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSlider,
+    QSpinBox,
     QStyle,
     QToolButton,
     QVBoxLayout,
@@ -32,21 +35,40 @@ from qtpy.QtWidgets import (
 )
 
 from ._metadata import MetadataPanel
-from ._reader import IMAGE_SUFFIXES, read_and_save_image, read_images
+from ._reader import (
+    IMAGE_SUFFIXES,
+    LayerData,
+    _canvas_czi_layers,
+    _compact_czi_layers,
+    read_and_save_image,
+    read_images,
+)
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class _SceneView:
+    """Source-local controls and the state needed to reverse display changes."""
+
     slider: bool = False
     index: int = 0
+    # Hidden scenes must not overwrite the user's own channel visibility.
     visibility: dict[Image, bool] = field(default_factory=dict)
+    # Restore original arrays from here, never by slicing the composed canvas.
+    canvas_sources: list[LayerData] = field(default_factory=list)
+
+
+def _is_scene_stack(layer: Image) -> bool:
+    return "scenes" in layer.metadata and not layer.metadata.get("czi_scene_canvas")
 
 
 def _scene_ids(layers: list[Image]) -> list[str]:
     return sorted(
-        {layer.metadata["series"] for layer in layers},
+        {
+            scene["series"] for layer in layers
+            for scene in layer.metadata.get("scenes", [layer.metadata])
+        },
         key=lambda name: (not name.isdecimal(), int(name) if name.isdecimal() else name),
     )
 
@@ -116,8 +138,16 @@ class VirtualReaderWidget(QWidget):
         self.scene_slider = QSlider(Qt.Orientation.Horizontal)
         self.scene_slider.setAccessibleName("CZI scene")
         self.scene_slider.valueChanged.connect(self._scene_changed)
+        self.scene_number = QSpinBox()
+        self.scene_number.setRange(1, 1)
+        self.scene_number.setPrefix("Scene ")
+        self.scene_number.setAccessibleName("CZI scene number")
+        self.scene_number.valueChanged.connect(
+            lambda number: self._scene_changed(number - 1)
+        )
         self.scene_label = QLabel("No multiple CZI scenes")
         row.addWidget(self.scene_slider)
+        row.addWidget(self.scene_number)
         row.addWidget(self.scene_label)
         layout.addLayout(row)
         self.metadata_panel = MetadataPanel(viewer)
@@ -126,6 +156,7 @@ class VirtualReaderWidget(QWidget):
         viewer.layers.selection.events.active.connect(self._sync_scene_controls)
         viewer.layers.events.inserted.connect(self._sync_scene_controls)
         viewer.layers.events.removed.connect(self._scene_removed)
+        viewer.dims.events.current_step.connect(self._native_scene_changed)
         self._sync_scene_controls()
         self._update_open()
 
@@ -146,6 +177,8 @@ class VirtualReaderWidget(QWidget):
         ]
 
     def _scene_removed(self, event) -> None:
+        if self._updating_scenes:
+            return
         load_id = event.value.metadata.get("czi_load_id")
         if load_id in self._scene_views:
             view = self._scene_views[load_id]
@@ -168,24 +201,36 @@ class VirtualReaderWidget(QWidget):
         scenes = _scene_ids(layers)
         self.scene_mode.setEnabled(len(scenes) > 1)
         self.scene_slider.setEnabled(False)
+        self.scene_number.setEnabled(False)
         if not scenes:
             self.scene_label.setText("No multiple CZI scenes")
             return
         load_id = layers[0].metadata["czi_load_id"]
+        native = _is_scene_stack(layers[0])
         view = self._scene_views.setdefault(
-            load_id, _SceneView(slider=self.scene_mode.currentIndex() == 1),
+            load_id, _SceneView(slider=native or self.scene_mode.currentIndex() == 1),
         )
+        if native:
+            scene_axis = self.viewer.dims.ndim - layers[0].ndim
+            view.index = self.viewer.dims.current_step[scene_axis]
         view.index = min(view.index, len(scenes) - 1)
-        self.scene_mode.blockSignals(True)
-        self.scene_slider.blockSignals(True)
-        self.scene_mode.setCurrentIndex(int(view.slider))
-        self.scene_slider.setRange(0, len(scenes) - 1)
-        self.scene_slider.setValue(view.index)
-        self.scene_mode.blockSignals(False)
-        self.scene_slider.blockSignals(False)
-        self.scene_slider.setEnabled(view.slider and len(scenes) > 1)
+        # Native S, the dock slider and the 1-based number field update each
+        # other. Programmatic changes must not start another scene conversion.
+        with (
+            QSignalBlocker(self.scene_mode),
+            QSignalBlocker(self.scene_slider),
+            QSignalBlocker(self.scene_number),
+        ):
+            self.scene_mode.setCurrentIndex(int(view.slider))
+            self.scene_slider.setRange(0, len(scenes) - 1)
+            self.scene_slider.setValue(view.index)
+            self.scene_number.setRange(1, len(scenes))
+            self.scene_number.setValue(view.index + 1)
+        self.scene_slider.setVisible(not native)
+        self.scene_slider.setEnabled(view.slider and len(scenes) > 1 and not native)
+        self.scene_number.setEnabled(view.slider and len(scenes) > 1)
         self.scene_label.setText(
-            f"{view.index + 1} / {len(scenes)} (series {scenes[view.index]})"
+            f"/ {len(scenes)} (series {scenes[view.index]})"
         )
         self._apply_scene_view(layers, scenes, view)
 
@@ -193,6 +238,10 @@ class VirtualReaderWidget(QWidget):
         self, layers: list[Image], scenes: list[str], view: _SceneView,
         *, fit: bool = False,
     ) -> None:
+        if "scenes" in layers[0].metadata:
+            if fit:
+                self.viewer.reset_view(layers=layers)
+            return
         selected = [
             layer for layer in layers
             if not view.slider or layer.metadata["series"] == scenes[view.index]
@@ -231,6 +280,134 @@ class VirtualReaderWidget(QWidget):
     def _scene_changed(self, index: int) -> None:
         self._change_scene_view(index=index)
 
+    def _native_scene_changed(self, event=None) -> None:
+        if self._updating_scenes:
+            return
+        layers = self._scene_layers()
+        if layers and _is_scene_stack(layers[0]):
+            self._sync_scene_controls()
+
+    def _scene_descriptions(self, layers: list[Image]) -> list[LayerData]:
+        """Recover individual scenes without reading pixels or changing layers."""
+        descriptions = []
+        for layer in layers:
+            description = layer.as_layer_data_tuple()
+            _, kwargs, _ = description
+            for key in ("scale", "translate", "axis_labels"):
+                kwargs[key] = tuple(kwargs[key])
+            if layer.metadata.get("czi_scene_canvas"):
+                descriptions.extend(self._scenes_from_canvas(layer, description))
+            elif _is_scene_stack(layer):
+                descriptions.extend(self._scenes_from_stack(layer, description))
+            else:
+                descriptions.append(description)
+        return descriptions
+
+    def _scenes_from_canvas(
+        self, layer: Image, description: LayerData,
+    ) -> list[LayerData]:
+        """Restore source pixels while keeping current canvas display settings."""
+        _, kwargs, kind = description
+        view = self._scene_views[layer.metadata["czi_load_id"]]
+        sources = [
+            source for source in view.canvas_sources
+            if source[1]["metadata"]["channel"] == layer.metadata["channel"]
+            and source[1]["metadata"]["multiscale_index"]
+            == layer.metadata["multiscale_index"]
+        ]
+        origin = np.min([kw["translate"] for _, kw, _ in sources], axis=0)
+        descriptions = []
+        for source_data, source_kwargs, _ in sources:
+            metadata = {**layer.metadata, **source_kwargs["metadata"]}
+            metadata.pop("scenes", None)
+            metadata.pop("czi_scene_canvas", None)
+            # A user may have moved or rescaled the canvas. Apply that change
+            # to each scene's relative origin, not to the cached source pixels.
+            relative_origin = np.asarray(source_kwargs["translate"]) - origin
+            scale_ratio = layer.scale / np.asarray(source_kwargs["scale"])
+            descriptions.append((
+                source_data,
+                {
+                    **kwargs,
+                    "metadata": metadata,
+                    "multiscale": source_kwargs["multiscale"],
+                    "translate": tuple(layer.translate + relative_origin * scale_ratio),
+                },
+                kind,
+            ))
+        return descriptions
+
+    @staticmethod
+    def _scenes_from_stack(layer: Image, description: LayerData) -> list[LayerData]:
+        """Remove the synthetic S axis and restore original scene positions."""
+        data, kwargs, kind = description
+        spatial_axes = list(range(1, layer.ndim))
+        # Every dimensional transform must lose S, not just scale/translation.
+        transform = CompositeAffine(
+            scale=layer.scale, translate=layer.translate,
+            rotate=layer.rotate, shear=layer.shear,
+        ).set_slice(spatial_axes)
+        spatial = {
+            key: getattr(transform, key) for key in ("scale", "rotate", "shear")
+        }
+        spatial["affine"] = layer.affine.set_slice(spatial_axes)
+        spatial["axis_labels"] = tuple(layer.axis_labels[1:])
+        spatial["units"] = tuple(layer.units[1:])
+        levels = data if layer.multiscale else [data]
+        scenes = layer.metadata["scenes"]
+        original_origins = np.asarray([scene["translate"] for scene in scenes])
+        # Stacking retained only origins shared by all scenes. Subtract that
+        # retained origin before applying any translation edits to the stack.
+        shared_origin = np.where(
+            np.all(original_origins == original_origins[0], axis=0),
+            original_origins[0], 0,
+        )
+        descriptions = []
+        for index, scene in enumerate(scenes):
+            metadata = {**layer.metadata, **scene}
+            metadata.pop("scenes")
+            scene_levels = [level[index] for level in levels]
+            descriptions.append((
+                scene_levels if layer.multiscale else scene_levels[0],
+                {
+                    **kwargs, **spatial,
+                    "translate": np.asarray(scene["translate"])
+                    + layer.translate[1:] - shared_origin,
+                    "name": f"{layer.name} | scene {scene['series']}",
+                    "metadata": metadata,
+                },
+                kind,
+            ))
+        return descriptions
+
+    def _replace_scene_layers(
+        self, layers: list[Image], descriptions: list[LayerData],
+    ) -> list[Image]:
+        # Validate replacements before removing any current viewer content.
+        replacements = [Image(data, **kwargs) for data, kwargs, _ in descriptions]
+        load_id = layers[0].metadata["czi_load_id"]
+        view = self._scene_views[load_id]
+        position = min(self.viewer.layers.index(layer) for layer in layers)
+        self._updating_scenes = True
+        try:
+            # Render the source hierarchy once, not once per replacement scene.
+            with self.metadata_panel.defer_updates():
+                for layer in view.visibility:
+                    layer.events.visible.disconnect(self._scene_visibility_changed)
+                view.visibility.clear()
+                for layer in layers:
+                    self.viewer.layers.remove(layer)
+                for index, layer in enumerate(replacements):
+                    self.viewer.add_layer(layer)
+                    self.viewer.layers.move(len(self.viewer.layers) - 1, position + index)
+                self.viewer.layers.selection.active = replacements[0]
+                if _is_scene_stack(replacements[0]):
+                    axis = self.viewer.dims.ndim - replacements[0].ndim
+                    self.viewer.dims.set_current_step(axis, view.index)
+        finally:
+            self._updating_scenes = False
+        return replacements
+
     def _change_scene_view(
         self, *, slider: bool | None = None, index: int | None = None,
     ) -> None:
@@ -242,6 +419,25 @@ class VirtualReaderWidget(QWidget):
             view.slider = slider
         if index is not None:
             view.index = index
+            if _is_scene_stack(layers[0]):
+                axis = self.viewer.dims.ndim - layers[0].ndim
+                self.viewer.dims.set_current_step(axis, index)
+                self._sync_scene_controls()
+                return
+        native = _is_scene_stack(layers[0])
+        if slider is not None and slider != native:
+            # Normalize both compact representations back to original scenes.
+            # Only then choose a new stack, canvas, or separate-layer fallback.
+            descriptions = self._scene_descriptions(layers)
+            if slider:
+                descriptions = _compact_czi_layers(descriptions)
+            else:
+                canvas = _canvas_czi_layers(descriptions)
+                if any(kw["metadata"].get("czi_scene_canvas") for _, kw, _ in canvas):
+                    view.canvas_sources = descriptions
+                descriptions = canvas
+            if native or any("scenes" in kw["metadata"] for _, kw, _ in descriptions):
+                layers = self._replace_scene_layers(layers, descriptions)
         self._sync_scene_controls()
         scenes = _scene_ids(layers)
         self._apply_scene_view(layers, scenes, view, fit=True)
@@ -336,13 +532,13 @@ class VirtualReaderWidget(QWidget):
         self._worker.start()
 
     @Slot(object)
-    def _loaded(self, layers: list) -> None:
+    def _loaded(self, layers: list[LayerData]) -> None:
         """Add layers on the owning viewer's Qt thread, not in the worker."""
         if self._closed:
             return
         added = []
         try:
-            for data, kwargs, _ in layers:
+            for data, kwargs, _ in _compact_czi_layers(layers):
                 added.append(self.viewer.add_image(data, **kwargs))
         except Exception as error:
             # Roll back only layers from this load, preserving earlier viewer

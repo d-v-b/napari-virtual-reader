@@ -7,6 +7,8 @@ second, competing metadata window.
 """
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -97,7 +99,11 @@ class MetadataPanel(QWidget):
             button.setAccessibleName(tooltip)
             # Capture this iteration's method, but choose the current tab at
             # click time. Without the default argument both buttons would collapse.
-            button.clicked.connect(lambda checked=False, method=method: getattr(self.tabs.currentWidget(), method)())
+            button.clicked.connect(
+                lambda checked=False, method=method: getattr(
+                    self.tabs.currentWidget(), method,
+                )()
+            )
             row.addWidget(button)
         layout.addLayout(row)
         self.tabs.addTab(self.structure, "Zarr structure")
@@ -141,6 +147,17 @@ class MetadataPanel(QWidget):
         """Follow image selection regardless of how the image was opened."""
         self.set_layer(self.viewer.layers.selection.active)
 
+    @contextmanager
+    def defer_updates(self) -> Iterator[None]:
+        """Refresh once after a batch of layer changes, even if it fails."""
+        try:
+            with self.viewer.layers.selection.events.active.blocker(
+                self._active_layer_changed,
+            ):
+                yield
+        finally:
+            self.set_layer(self.viewer.layers.selection.active)
+
     def _node(self, parent: Any, name: str, node: dict) -> None:
         """Show array shape/dtype and make chunk grids/codecs inspectable."""
         metadata = node.get("metadata", {})
@@ -148,7 +165,8 @@ class MetadataPanel(QWidget):
         if node["kind"] == "array":
             shape = " x ".join(str(size) for size in metadata["shape"])
             # Zarr metadata versions use different dtype keys in their dictionaries.
-            layout = f"{shape} | {metadata.get('data_type', metadata.get('dtype', ''))}"
+            dtype = metadata.get("data_type", metadata.get("dtype", ""))
+            layout = f"{shape} | {dtype}"
         item = QTreeWidgetItem(parent, [name, layout])
         properties = metadata if node["kind"] == "array" else node["attributes"]
         item.setData(0, Qt.UserRole, properties)
@@ -182,9 +200,12 @@ class MetadataPanel(QWidget):
         """Expose complete, selectable values without widening the tree columns."""
         # Plain text avoids interpreting source attributes as HTML. default=str
         # keeps non-JSON metadata inspectable without modifying the stored values.
-        self.detail.setPlainText(
-            json.dumps(item.data(0, Qt.UserRole), indent=2, ensure_ascii=True, default=str) if item else ""
-        )
+        text = ""
+        if item is not None:
+            text = json.dumps(
+                item.data(0, Qt.UserRole), indent=2, ensure_ascii=True, default=str,
+            )
+        self.detail.setPlainText(text)
 
     def _filter(self, text: str) -> None:
         """Retain matching rows and their ancestors in both inspector views."""
@@ -194,8 +215,11 @@ class MetadataPanel(QWidget):
             # Visit every child before testing the parent. Short-circuiting the
             # recursion would leave stale hidden states after changing a filter.
             # A matching descendant keeps its ancestor path visible and expanded.
-            child_matches = [visit(item.child(index)) for index in range(item.childCount())]
-            matches = not text or text in f"{item.text(0)} {item.text(1)}".casefold() or any(child_matches)
+            child_matches = [
+                visit(item.child(index)) for index in range(item.childCount())
+            ]
+            row_text = f"{item.text(0)} {item.text(1)}".casefold()
+            matches = not text or text in row_text or any(child_matches)
             item.setHidden(not matches)
             if text and any(child_matches):
                 item.setExpanded(True)
