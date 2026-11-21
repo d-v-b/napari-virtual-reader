@@ -67,8 +67,9 @@ The plugin is also listed on
   including full resolution when native tiles are available. Napari switches
   between stored resolution levels as you zoom, without loading the whole image
   or writing a converted copy.
-- **Multiple scenes:** compatible scenes share an **S** dimension slider.
-  Scenes with different sizes or scales remain separate.
+- **Multiple scenes:** choose **One canvas** or **Scene slider** in the dock.
+  Both modes support matching and different scene sizes, scales, dtypes, and
+  pyramid depths without padding or resampling.
 
 **Why assembly helps:** refkv can expose irregular or overlapping CZI tiles
 separately from its regular image levels. Reading only those levels can omit
@@ -149,6 +150,29 @@ plugin from the menu before or after a reader load reuses the dock rather than
 creating a second panel. A new reader load also reopens the dock if it was hidden.
 The inspector follows the selected image layer, independently of how it was loaded.
 
+### CZI scene display
+
+Select a layer from a multi-scene CZI, then use **CZI scenes** in the dock:
+
+- **One canvas** (default): display the individual scene layers together at their
+  recorded physical positions, including differently sized scenes.
+- **Scene slider**: show only the selected scene's channels. Move the slider to
+  switch scenes in numeric series order; the camera fits the selected scene.
+  Each scene retains its original lazy arrays, pyramid levels, dtype, scale and
+  translation. No common-sized scene array or converted pixel copy is created.
+
+Switch modes after loading without reopening the file. The controls apply to
+the selected layer's source load; other images and repeated loads of the same
+file remain independent. Channel visibility settings are retained across scene
+switches and when returning to canvas. Selecting an unrelated layer disables
+the controls. CZI-derived VZIPs use the same scene controls, but retain their
+existing tile-assembly limitations.
+
+This is a dock slider, not a padded napari **S** dimension. A single CZI scene
+containing multiple separated scan regions still counts as one scene; the reader
+does not invent scene boundaries. The controls require multiple OME image series
+exposed by refkv.
+
 - **Zarr structure** shows expandable groups and arrays, including original
   shapes, dtypes, attributes, chunk grids and codec configuration.
 - **Metadata** shows the selected layer's OME metadata, source and channel
@@ -204,9 +228,11 @@ Selecting an unrelated layer clears the inspector.
   not channel count or names. Component order is corrected per pyramid level:
   raw/Zstd/LZW BGR(A) is reordered, while JPEG/JPEG-XR RGB(A) is retained.
   Complex-valued packed-colour CZI pixels are not supported.
-- Compatible CZI scenes are stacked lazily along a leading
-  **S** axis, in numeric series order. This also applies to CZI-derived
-  VZIP archives. Other formats retain separate series layers.
+- GUI loads retain individual CZI scene layers for canvas/slider display.
+  Other formats retain separate series layers without CZI scene controls.
+  Scripted `read_images(path)` calls retain the earlier behavior of stacking
+  compatible CZI scenes lazily on a leading **S** axis. Pass
+  `stack_scenes=False` to retain individual scenes for the dock controls.
 - RGB/RGBA keeps its component axis last, outside napari's dimension sliders;
   ordinary fluorescence channels remain separate additive layers. Loading and
   reordering stay lazy, preserve pixel dtype, and do not write converted images.
@@ -214,7 +240,8 @@ Selecting an unrelated layer clears the inspector.
   pyramid levels. Incompatible scenes remain separate without cropping or
   resampling. Axes with differing scene origins use zero translation on the
   stacked layer; shared origins are retained. Original origins and metadata
-  remain available in the layer's `metadata["scenes"]` list.
+  remain available in the layer's `metadata["scenes"]` list. These compatibility
+  restrictions apply only to scripted S stacks, not the dock's scene slider.
 - Stored multiscale pyramids, OME axis ordering, physical scale/origin, channel
   names, colors, and display windows.
 - Regular and rectilinear chunk grids, without scanning complete lazy arrays
@@ -224,8 +251,8 @@ Selecting an unrelated layer clears the inspector.
 
 This is deliberately not a replacement for every refkv dataset interface:
 non-image tables, audio, arbitrary tensors, remote inputs, and stores without
-OME image metadata are outside this first version. There are no custom dimension
-sliders or CZI-specific options.
+OME image metadata are outside this first version. Time and Z use napari's
+dimension sliders; the dock adds CZI scene-display controls.
 
 ## Development
 

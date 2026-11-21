@@ -23,7 +23,8 @@ def test_worker_opens_on_main_thread(qtbot, monkeypatch):
     viewer.window._qt_window.findChildren.return_value = []
     viewer.add_image.side_effect = lambda *args, **kwargs: display_threads.append(threading.get_ident())
 
-    def prepare(path):
+    def prepare(path, *, stack_scenes):
+        assert stack_scenes is False
         worker_threads.append(threading.get_ident())
         return [(da.zeros((8, 10)), {"contrast_limits": (0, 1)}, "image")]
 
@@ -50,7 +51,7 @@ def test_failure_restores_controls(qtbot, monkeypatch):
     notify = Mock()
     monkeypatch.setattr("napari.utils.notifications.show_error", notify)
 
-    def fail(path):
+    def fail(path, *, stack_scenes):
         raise ValueError("Unsupported image")
 
     monkeypatch.setattr("napari_virtual_reader._widget.read_images", fail)
@@ -211,8 +212,105 @@ def test_save_dialog_cancellation_and_replacement(tmp_path, qtbot, monkeypatch, 
     if choice == "replace":
         assert create_worker.call_args.args[1:] == (widget.filename.text(), str(output))
         assert create_worker.call_args.kwargs["overwrite"] is True
+        assert create_worker.call_args.kwargs["stack_scenes"] is False
         create_worker.return_value.start.assert_called_once()
     else:
         create_worker.assert_not_called()
         assert widget.open_button.isEnabled()
     assert output.read_bytes() == b"existing archive"
+
+
+@pytest.mark.parametrize("difference", ["matching", "shape", "scale", "dtype", "levels"])
+def test_scene_slider_and_canvas_keep_independent_scene_data(
+    qtbot, make_napari_viewer, difference,
+):
+    """Both modes work without padding/resampling or flattening scene pyramids."""
+    viewer = make_napari_viewer()
+    unrelated = viewer.add_image(np.zeros((3, 4)), name="Unrelated")
+    _, widget = viewer.window.add_plugin_dock_widget("napari-virtual-reader")
+    root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
+    root.attrs["refkv_zarrified"] = {"profile": "czi"}
+    for scene in (2, 10):
+        group = root.create_group(str(scene))
+        shape = (2, 12, 16) if scene == 10 and difference == "shape" else (2, 8, 10)
+        dtype = "uint8" if scene == 10 and difference == "dtype" else "uint16"
+        scale = 0.4 if scene == 10 and difference == "scale" else 0.2
+        data = np.full(shape, scene, dtype=dtype)
+        group.create_array("0", data=data, chunks=(1, 4, 5))
+        datasets = [{
+            "path": "0",
+            "coordinateTransformations": [
+                {"type": "scale", "scale": [1, scale, scale]},
+                {"type": "translation", "translation": [0, scene * 10, scene * 20]},
+            ],
+        }]
+        if not (scene == 10 and difference == "levels"):
+            group.create_array("1", data=data[:, ::2, ::2], chunks=(1, 2, 3))
+            datasets.append({"path": "1"})
+        group.attrs["ome"] = {
+            "multiscales": [{"axes": ["c", "y", "x"], "datasets": datasets}],
+        }
+    layers = [
+        viewer.add_image(data, **kwargs)
+        for data, kwargs, _ in _layers(root, Path("scenes.czi"), stack_scenes=False)
+    ]
+    original = [(layer.data, tuple(layer.scale), tuple(layer.translate)) for layer in layers]
+    assert widget.scene_mode.isEnabled()
+    assert all(layer.visible for layer in layers)
+    assert not widget.scene_slider.isEnabled()
+    # Preserve a manually hidden channel when leaving and returning to canvas.
+    layers[1].visible = False
+    widget.scene_mode.setCurrentText("Scene slider")
+    assert widget.scene_slider.isEnabled()
+    assert [layer.visible for layer in layers] == [True, False, False, False]
+    np.testing.assert_allclose(viewer.scene.camera.center[-2:], (20.7, 40.9))
+    widget.scene_slider.setValue(1)
+    assert "series 10" in widget.scene_label.text()
+    assert [layer.visible for layer in layers] == [False, False, True, True]
+    assert viewer.layers.selection.active is layers[2]
+    assert widget.metadata_panel.source.text() == "scenes.czi"
+    assert unrelated.visible
+    layers[3].visible = False
+    widget.scene_slider.setValue(0)
+    widget.scene_slider.setValue(1)
+    assert [layer.visible for layer in layers] == [False, False, True, False]
+    for layer, (data, scale, translate) in zip(layers, original):
+        assert layer.data is data
+        assert tuple(layer.scale) == scale
+        assert tuple(layer.translate) == translate
+    widget.scene_mode.setCurrentText("One canvas")
+    assert [layer.visible for layer in layers] == [True, False, True, False]
+    assert unrelated.visible
+    # Removing the selected scene clamps the slider and restores its remaining scene.
+    widget.scene_mode.setCurrentText("Scene slider")
+    viewer.layers.remove(layers[2])
+    viewer.layers.remove(layers[3])
+    assert not widget.scene_mode.isEnabled()
+    assert layers[0].visible
+
+
+def test_scene_controls_isolate_repeated_source_loads(qtbot, make_napari_viewer):
+    viewer = make_napari_viewer()
+    _, widget = viewer.window.add_plugin_dock_widget("napari-virtual-reader")
+    root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
+    root.attrs["refkv_zarrified"] = {"profile": "czi"}
+    for scene in (0, 1):
+        group = root.create_group(str(scene))
+        group.create_array("0", data=np.full((8, 10), scene, dtype="uint16"))
+        group.attrs["ome"] = {
+            "multiscales": [{"axes": ["y", "x"], "datasets": [{"path": "0"}]}],
+        }
+    loads = [
+        [viewer.add_image(data, **kwargs) for data, kwargs, _ in
+         _layers(root, Path("same.czi"), stack_scenes=False)]
+        for _ in range(2)
+    ]
+    widget.scene_mode.setCurrentText("Scene slider")
+    widget.scene_slider.setValue(1)
+    assert [layer.visible for layer in loads[0]] == [True, True]
+    assert [layer.visible for layer in loads[1]] == [False, True]
+    viewer.layers.selection.active = loads[0][0]
+    assert widget.scene_mode.currentText() == "One canvas"
+    viewer.layers.selection.active = loads[1][1]
+    assert widget.scene_mode.currentText() == "Scene slider"
+    assert widget.scene_slider.value() == 1

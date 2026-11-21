@@ -7,13 +7,16 @@ The embedded MetadataPanel follows selection independently of the open action.
 """
 
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import napari
+from napari.layers import Image
 from napari.qt.threading import create_worker
 from qtpy.QtCore import Qt, Slot
 from qtpy.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -21,6 +24,7 @@ from qtpy.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSlider,
     QStyle,
     QToolButton,
     QVBoxLayout,
@@ -31,6 +35,20 @@ from ._metadata import MetadataPanel
 from ._reader import IMAGE_SUFFIXES, read_and_save_image, read_images
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _SceneView:
+    slider: bool = False
+    index: int = 0
+    visibility: dict[Image, bool] = field(default_factory=dict)
+
+
+def _scene_ids(layers: list[Image]) -> list[str]:
+    return sorted(
+        {layer.metadata["series"] for layer in layers},
+        key=lambda name: (not name.isdecimal(), int(name) if name.isdecimal() else name),
+    )
 
 
 class VirtualReaderWidget(QWidget):
@@ -47,6 +65,8 @@ class VirtualReaderWidget(QWidget):
         self._worker = None
         self._closed = False
         self._archive_path = None
+        self._scene_views: dict[str, _SceneView] = {}
+        self._updating_scenes = False
         self.setMinimumWidth(260)
         self.setAcceptDrops(True)
         layout = QVBoxLayout(self)
@@ -81,10 +101,150 @@ class VirtualReaderWidget(QWidget):
         self.status.setWordWrap(True)
         self.status.setTextFormat(Qt.PlainText)
         layout.addWidget(self.status)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("CZI scenes"))
+        self.scene_mode = QComboBox()
+        self.scene_mode.addItems(["One canvas", "Scene slider"])
+        self.scene_mode.setToolTip(
+            "Display all scenes at their recorded positions, or one scene at a time. "
+            "Works with matching and different scene sizes."
+        )
+        self.scene_mode.currentIndexChanged.connect(self._scene_mode_changed)
+        row.addWidget(self.scene_mode)
+        layout.addLayout(row)
+        row = QHBoxLayout()
+        self.scene_slider = QSlider(Qt.Orientation.Horizontal)
+        self.scene_slider.setAccessibleName("CZI scene")
+        self.scene_slider.valueChanged.connect(self._scene_changed)
+        self.scene_label = QLabel("No multiple CZI scenes")
+        row.addWidget(self.scene_slider)
+        row.addWidget(self.scene_label)
+        layout.addLayout(row)
         self.metadata_panel = MetadataPanel(viewer)
         # Keep loading controls compact at the top; the inspector gets extra height.
         layout.addWidget(self.metadata_panel, stretch=1)
+        viewer.layers.selection.events.active.connect(self._sync_scene_controls)
+        viewer.layers.events.inserted.connect(self._sync_scene_controls)
+        viewer.layers.events.removed.connect(self._scene_removed)
+        self._sync_scene_controls()
         self._update_open()
+
+    def _scene_layers(self) -> list[Image]:
+        active = self.viewer.layers.selection.active
+        if not isinstance(active, Image):
+            return []
+        load_id = active.metadata.get("czi_load_id")
+        if not load_id:
+            return []
+        return self._scene_group_layers(load_id)
+
+    def _scene_group_layers(self, load_id: str) -> list[Image]:
+        return [
+            layer for layer in self.viewer.layers
+            if isinstance(layer, Image)
+            and layer.metadata.get("czi_load_id") == load_id
+        ]
+
+    def _scene_removed(self, event) -> None:
+        load_id = event.value.metadata.get("czi_load_id")
+        if load_id in self._scene_views:
+            view = self._scene_views[load_id]
+            if event.value in view.visibility:
+                event.value.events.visible.disconnect(self._scene_visibility_changed)
+            view.visibility.pop(event.value, None)
+            layers = self._scene_group_layers(load_id)
+            if layers:
+                scenes = _scene_ids(layers)
+                view.index = min(view.index, len(scenes) - 1)
+                self._apply_scene_view(layers, scenes, view)
+            else:
+                del self._scene_views[load_id]
+        self._sync_scene_controls()
+
+    def _sync_scene_controls(self, event=None) -> None:
+        if self._updating_scenes:
+            return
+        layers = self._scene_layers()
+        scenes = _scene_ids(layers)
+        self.scene_mode.setEnabled(len(scenes) > 1)
+        self.scene_slider.setEnabled(False)
+        if not scenes:
+            self.scene_label.setText("No multiple CZI scenes")
+            return
+        load_id = layers[0].metadata["czi_load_id"]
+        view = self._scene_views.setdefault(
+            load_id, _SceneView(slider=self.scene_mode.currentIndex() == 1),
+        )
+        view.index = min(view.index, len(scenes) - 1)
+        self.scene_mode.blockSignals(True)
+        self.scene_slider.blockSignals(True)
+        self.scene_mode.setCurrentIndex(int(view.slider))
+        self.scene_slider.setRange(0, len(scenes) - 1)
+        self.scene_slider.setValue(view.index)
+        self.scene_mode.blockSignals(False)
+        self.scene_slider.blockSignals(False)
+        self.scene_slider.setEnabled(view.slider and len(scenes) > 1)
+        self.scene_label.setText(
+            f"{view.index + 1} / {len(scenes)} (series {scenes[view.index]})"
+        )
+        self._apply_scene_view(layers, scenes, view)
+
+    def _apply_scene_view(
+        self, layers: list[Image], scenes: list[str], view: _SceneView,
+        *, fit: bool = False,
+    ) -> None:
+        selected = [
+            layer for layer in layers
+            if not view.slider or layer.metadata["series"] == scenes[view.index]
+        ]
+        self._updating_scenes = True
+        try:
+            for layer in layers:
+                if view.slider:
+                    if layer not in view.visibility:
+                        view.visibility[layer] = layer.visible
+                        layer.events.visible.connect(self._scene_visibility_changed)
+                    layer.visible = view.visibility[layer] and layer in selected
+                elif layer in view.visibility:
+                    layer.visible = view.visibility.pop(layer)
+                    layer.events.visible.disconnect(self._scene_visibility_changed)
+            if fit:
+                self.viewer.layers.selection.active = next(
+                    (layer for layer in selected if layer.visible), selected[0],
+                )
+                self.viewer.reset_view(layers=selected)
+        finally:
+            self._updating_scenes = False
+
+    def _scene_visibility_changed(self, event) -> None:
+        if self._updating_scenes:
+            return
+        layer = event.source
+        view = self._scene_views[layer.metadata["czi_load_id"]]
+        view.visibility[layer] = layer.visible
+        layers = self._scene_group_layers(layer.metadata["czi_load_id"])
+        self._apply_scene_view(layers, _scene_ids(layers), view)
+
+    def _scene_mode_changed(self, index: int) -> None:
+        self._change_scene_view(slider=index == 1)
+
+    def _scene_changed(self, index: int) -> None:
+        self._change_scene_view(index=index)
+
+    def _change_scene_view(
+        self, *, slider: bool | None = None, index: int | None = None,
+    ) -> None:
+        layers = self._scene_layers()
+        if not layers:
+            return
+        view = self._scene_views[layers[0].metadata["czi_load_id"]]
+        if slider is not None:
+            view.slider = slider
+        if index is not None:
+            view.index = index
+        self._sync_scene_controls()
+        scenes = _scene_ids(layers)
+        self._apply_scene_view(layers, scenes, view, fit=True)
 
     def _update_open(self) -> None:
         """Enable opening only when there is an input and no active worker."""
@@ -151,7 +311,7 @@ class VirtualReaderWidget(QWidget):
             self._archive_path = output
             operation = read_and_save_image
             arguments = (path, str(output))
-            options = {"overwrite": overwrite}
+            options["overwrite"] = overwrite
         self._closed = False
         self.status.setText(f"Opening {Path(path).name}...")
         # Connect every signal before starting, including for very fast loads.
@@ -162,6 +322,7 @@ class VirtualReaderWidget(QWidget):
             *arguments,
             _start_thread=False,
             _ignore_errors=True,
+            stack_scenes=False,
             **options,
         )
         self._worker.returned.connect(self._loaded)

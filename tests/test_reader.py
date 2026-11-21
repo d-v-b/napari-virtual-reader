@@ -385,7 +385,8 @@ def test_non_image_dataset():
 
 
 @pytest.mark.parametrize("source_name", ["plate.czi", "plate.vzip"])
-def test_czi_scenes_stack_lazily_per_channel(monkeypatch, source_name):
+@pytest.mark.parametrize("stack_scenes", [True, False])
+def test_czi_scenes_stack_lazily_per_channel(monkeypatch, source_name, stack_scenes):
     """Stack scene-ordered pyramids without reads and retain each stage position."""
     root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
     root.attrs["refkv_zarrified"] = {"profile": "czi"}
@@ -423,8 +424,19 @@ def test_czi_scenes_stack_lazily_per_channel(monkeypatch, source_name):
         return getitem(array, selection)
 
     monkeypatch.setattr(zarr.Array, "__getitem__", record)
-    layers = _layers(root, Path(source_name))
+    layers = _layers(root, Path(source_name), stack_scenes=stack_scenes)
     assert not reads
+    if not stack_scenes:
+        assert len(layers) == 6
+        assert len({kwargs["metadata"]["czi_load_id"] for _, kwargs, _ in layers}) == 1
+        for index, (levels, kwargs, _) in enumerate(layers):
+            scene, channel = (0, 2, 10)[index // 2], index % 2
+            assert kwargs["axis_labels"] == ("z", "y", "x")
+            assert kwargs["translate"] == (0, scene * 10, scene * 20)
+            assert levels[0].shape == (4, 8, 10)
+            np.testing.assert_array_equal(levels[0].compute(), data[channel] + scene)
+            np.testing.assert_array_equal(levels[1].compute(), data[channel, ..., ::2, ::2] + scene)
+        return
     assert len(layers) == 2
     for channel, (levels, kwargs, _) in enumerate(layers):
         assert levels[0].shape == (3, 4, 8, 10)

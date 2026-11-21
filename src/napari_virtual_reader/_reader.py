@@ -13,9 +13,11 @@ receives a separate snapshot of the original store, not the displayed mosaic.
 import os
 import sys
 from collections.abc import Iterator
+from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+from uuid import uuid4
 
 import dask.array as da
 import numpy as np
@@ -250,14 +252,17 @@ def _zarr_structure(group: Any) -> dict:
 
 def _layers(
     root: Any, source: Path, czi_image_factors: list | None = None,
+    *, stack_scenes: bool = True,
 ) -> list[tuple[Any, dict, str]]:
     """Translate OME axes, stored pyramids, transforms and channels to layers.
 
     First build ordinary per-channel image layers. Then assemble eligible CZI
-    mosaics, stack compatible scenes, and attach source metadata plus warnings.
+    mosaics, optionally stack compatible scenes, and attach metadata and warnings.
     All array slicing, transposition and stacking in preparation remain lazy.
     ``czi_image_factors`` is raw refkv calibration data, not a request to create
     additional pyramid resolutions.
+    GUI callers disable ``stack_scenes`` so each scene retains its own shape,
+    transform and pyramid for the dock's canvas/slider controls.
     """
     from napari.utils.colormaps import Colormap
 
@@ -407,7 +412,12 @@ def _layers(
         # Assembly needs individual scene coordinates. Stack only afterwards,
         # once each scene's final extent and available resolutions are known.
         assembled_tiles = assemble_czi_layers(root, layers, czi_image_factors or [])
-        layers = _stack_czi_scenes(layers, source)
+        if stack_scenes:
+            layers = _stack_czi_scenes(layers, source)
+        else:
+            load_id = uuid4().hex
+            for _, kwargs, _ in layers:
+                kwargs["metadata"]["czi_load_id"] = load_id
     structure = _zarr_structure(root)
     warning = None
     if is_czi:
@@ -441,11 +451,15 @@ def _layers(
     return layers
 
 
-def read_images(path: str | list[str]) -> list[tuple[Any, dict, str]]:
+def read_images(
+    path: str | list[str], *, stack_scenes: bool = True,
+) -> list[tuple[Any, dict, str]]:
     """Open local images or VZIP archives as lazy virtual OME-Zarr layers.
 
     Args:
         path: One local source path or a list of source paths.
+        stack_scenes: Stack compatible CZI scenes on S for scripted use.
+            False keeps individual scenes for the dock's canvas/slider controls.
 
     Returns:
         napari layer-data tuples containing lazy arrays and display metadata.
@@ -482,12 +496,13 @@ def read_images(path: str | list[str]) -> list[tuple[Any, dict, str]]:
             # Keep it separate from OME metadata; it is not persisted in VZIP.
             image_factors = reference.info.get("images")
         root = zarr.open_group(store, mode="r")
-        layers.extend(_layers(root, source, image_factors))
+        layers.extend(_layers(root, source, image_factors, stack_scenes=stack_scenes))
     return layers
 
 
 def read_and_save_image(
-    path: str, archive_path: str, *, overwrite: bool = False
+    path: str, archive_path: str, *, overwrite: bool = False,
+    stack_scenes: bool = True,
 ) -> list[tuple[Any, dict, str]]:
     """Prepare lazy layers and atomically save their reference archive, not pixels.
 
@@ -495,6 +510,8 @@ def read_and_save_image(
         path: Local image source; existing VZIP archives are not accepted.
         archive_path: Destination ending in .vzip, separate from the source.
         overwrite: Allow atomic replacement of an existing destination.
+        stack_scenes: Stack compatible CZI scenes on S, or retain individual
+            scenes for the dock's canvas/slider controls.
 
     Returns:
         napari layer-data tuples retaining references to the original source.
@@ -530,7 +547,9 @@ def read_and_save_image(
         raise FileExistsError(f"Archive already exists: {destination}")
     reference = zarrify(str(source))
     root = zarr.open_group(refkv.zarr.store(reference), mode="r")
-    layers = _layers(root, source, reference.info.get("images"))
+    layers = _layers(
+        root, source, reference.info.get("images"), stack_scenes=stack_scenes,
+    )
     # Stage beside the destination so publication stays on one filesystem.
     # Never stream an incomplete archive over an existing user's file.
     with TemporaryDirectory(prefix=".refkv-", dir=destination.parent) as temporary:
@@ -566,5 +585,5 @@ def napari_get_reader(path: str | list[str]):
             from ._metadata import prepare_metadata_inspectors
 
             prepare_metadata_inspectors()
-        return read_images
+        return partial(read_images, stack_scenes=False)
     return None

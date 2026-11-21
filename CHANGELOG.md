@@ -7,6 +7,17 @@ is recorded separately from the release preparation date.
 
 ## Unreleased
 
+### Added
+
+- Added dock controls to switch CZI scenes between one canvas at their recorded
+  positions and a one-scene-at-a-time slider. Both modes support matching and
+  nonmatching scene sizes, scales, dtypes and pyramid depths without padding,
+  resampling, or reopening the file. Scene switching fits the camera and keeps
+  channels and metadata together, with independent controls per source load.
+- GUI reader/opener loads retain individual scenes for these controls.
+  Scripted readers keep compatible S stacks by default; `stack_scenes=False`
+  requests individual scenes.
+
 ## 0.0.3 - 2026-11-21
 
 ### Changed
