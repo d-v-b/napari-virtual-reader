@@ -253,6 +253,11 @@ Source guide:
 
 ## Releases
 
+Version [0.0.3](_release_notes/v0.0.3.md) adds lazy 2D CZI mosaic assembly,
+packed-colour CZI handling, a combined loading and metadata dock, and visual
+documentation. The package remains experimental Beta software; review
+[Scope](#scope) before using it for analysis.
+
 The package workflow tests pull requests and pushes to `main`. PyPI publishing
 runs only after its test matrix passes on a pushed tag beginning with `v`;
 use the release convention `vX.Y.Z`.

@@ -7,6 +7,8 @@ is recorded separately from the release preparation date.
 
 ## Unreleased
 
+## 0.0.3 - 2026-11-21
+
 ### Changed
 
 - Added lazy, chunk-local mosaic assembly for supported 2D CZI slide scans:
@@ -26,11 +28,22 @@ is recorded separately from the release preparation date.
   loading and optional VZIP-save controls above the expanding inspector.
 - File/Open, canvas drag-and-drop, and the plugin menu now share the same dock
   regardless of opening order; reader loads reopen it when hidden.
+- Added rendered visual guides for the plugin workflow and CZI tile assembly,
+  with automated GitHub Pages publishing.
+- Marked the package as experimental Beta software.
 
 ### Fixed
 
 - Prevented the metadata inspector from appearing as a separate dock above
   the file-loading controls.
+- Corrected the package's Beta classifier to the valid PyPI classifier.
+
+### Release Status
+
+Release tag: `v0.0.3`. Tag-triggered GitHub Actions validates the supported
+platforms and Python versions before publishing to PyPI.
+See the [release notes](_release_notes/v0.0.3.md) for highlights, validation,
+and known limitations.
 
 ## 0.0.2 - 2026-11-06
 
