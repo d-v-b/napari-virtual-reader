@@ -258,7 +258,10 @@ packed-colour CZI handling, a combined loading and metadata dock, and visual
 documentation. The package remains experimental Beta software; review
 [Scope](#scope) before using it for analysis.
 
-The package workflow tests pull requests and pushes to `main`. PyPI publishing
+The package workflow tests pull requests and pushes to `main` against
+`refkv[zarr,images]==0.2.0` from PyPI on Linux, Windows, and macOS with
+Python 3.12, 3.13, and 3.14. The runtime requirement remains refkv 0.2.0 or newer.
+PyPI publishing
 runs only after its test matrix passes on a pushed tag beginning with `v`;
 use the release convention `vX.Y.Z`.
 

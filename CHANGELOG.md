@@ -31,6 +31,8 @@ is recorded separately from the release preparation date.
 - Added rendered visual guides for the plugin workflow and CZI tile assembly,
   with automated GitHub Pages publishing.
 - Marked the package as experimental Beta software.
+- Pinned CI validation to PyPI's refkv 0.2.0 across the supported platform and
+  Python matrix; the runtime requirement remains refkv 0.2.0 or newer.
 
 ### Fixed
 
