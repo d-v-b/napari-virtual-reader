@@ -1,4 +1,10 @@
-"""Small, asynchronous file opener; napari owns all display controls."""
+"""Combined asynchronous file opener and read-only metadata inspector.
+
+The Qt thread owns dialogs, controls and layer insertion. A preparation worker
+opens reference stores, builds lazy layer tuples and optionally saves a VZIP.
+It does not load a whole image; napari/Dask request pixels when displaying it.
+The embedded MetadataPanel follows selection independently of the open action.
+"""
 
 import logging
 from pathlib import Path
@@ -21,14 +27,19 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from ._metadata import ensure_metadata_panel
+from ._metadata import MetadataPanel
 from ._reader import IMAGE_SUFFIXES, read_and_save_image, read_images
 
 logger = logging.getLogger(__name__)
 
 
 class VirtualReaderWidget(QWidget):
-    """Open images through refkv, preparing layers away from the Qt main thread."""
+    """Open images through refkv, preparing layers away from the Qt main thread.
+
+    One active worker makes the dock busy until its finished signal restores
+    the controls. Closing the widget discards late results; it does not cancel
+    an in-flight preparation or archive write.
+    """
 
     def __init__(self, viewer: napari.Viewer) -> None:
         super().__init__()
@@ -36,8 +47,6 @@ class VirtualReaderWidget(QWidget):
         self._worker = None
         self._closed = False
         self._archive_path = None
-        self.metadata_panel = ensure_metadata_panel(viewer)
-        self._metadata_dock = self.metadata_panel.dock
         self.setMinimumWidth(260)
         self.setAcceptDrops(True)
         layout = QVBoxLayout(self)
@@ -63,6 +72,7 @@ class VirtualReaderWidget(QWidget):
         self.open_button.clicked.connect(self._open)
         layout.addWidget(self.open_button)
         self.progress = QProgressBar()
+        # Metadata work has no reliable byte-based completion percentage.
         self.progress.setRange(0, 0)
         self.progress.setTextVisible(False)
         self.progress.hide()
@@ -71,7 +81,9 @@ class VirtualReaderWidget(QWidget):
         self.status.setWordWrap(True)
         self.status.setTextFormat(Qt.PlainText)
         layout.addWidget(self.status)
-        layout.addStretch()
+        self.metadata_panel = MetadataPanel(viewer)
+        # Keep loading controls compact at the top; the inspector gets extra height.
+        layout.addWidget(self.metadata_panel, stretch=1)
         self._update_open()
 
     def _update_open(self) -> None:
@@ -104,6 +116,8 @@ class VirtualReaderWidget(QWidget):
         arguments = (path,)
         options = {}
         if self.save_archive.isChecked() and Path(path).suffix.lower() != ".vzip":
+            # Resolve the destination and replacement consent before starting any
+            # work. Cancelling either dialog cancels the entire open action.
             destination, _ = QFileDialog.getSaveFileName(
                 self,
                 "Save VZIP archive",
@@ -120,6 +134,8 @@ class VirtualReaderWidget(QWidget):
                 self._failed(ValueError("Choose a separate .vzip archive destination."))
                 return
             overwrite = output.exists()
+            # QFileDialog's automatic overwrite prompt is disabled so consent
+            # applies to the normalized path, including an appended .vzip suffix.
             if (
                 overwrite
                 and QMessageBox.question(
@@ -138,6 +154,9 @@ class VirtualReaderWidget(QWidget):
             options = {"overwrite": overwrite}
         self._closed = False
         self.status.setText(f"Opening {Path(path).name}...")
+        # Connect every signal before starting, including for very fast loads.
+        # _ignore_errors prevents the worker's automatic re-raise, not reporting:
+        # the errored signal below logs and notifies through _failed.
         self._worker = create_worker(
             operation,
             *arguments,
@@ -150,6 +169,7 @@ class VirtualReaderWidget(QWidget):
         self._worker.finished.connect(self._finished)
         self.filename.setEnabled(False)
         self.browse.setEnabled(False)
+        # Freeze the visible input while the worker uses the captured arguments.
         self._update_open()
         self.progress.show()
         self._worker.start()
@@ -164,6 +184,8 @@ class VirtualReaderWidget(QWidget):
             for data, kwargs, _ in layers:
                 added.append(self.viewer.add_image(data, **kwargs))
         except Exception as error:
+            # Roll back only layers from this load, preserving earlier viewer
+            # content. An archive already saved by the worker remains on disk.
             for layer in added:
                 self.viewer.layers.remove(layer)
             self._failed(error)
@@ -179,6 +201,8 @@ class VirtualReaderWidget(QWidget):
         """Report external file/codec errors without silently switching readers."""
         from napari.utils.notifications import show_error
 
+        # Keep the traceback even if the widget closed before the worker failed.
+        # Only the on-screen notification is suppressed for a closed widget.
         logger.error(
             "Virtual image opening failed: %s",
             error,
@@ -206,6 +230,8 @@ class VirtualReaderWidget(QWidget):
 
     def dropEvent(self, event) -> None:
         """Select a dropped input; opening remains an explicit action."""
+        # Unlike a canvas drop, a dock drop must allow review of the save option
+        # and path before starting potentially expensive metadata preparation.
         urls = event.mimeData().urls()
         if self._worker is None and len(urls) == 1 and urls[0].isLocalFile():
             self.filename.setText(urls[0].toLocalFile())

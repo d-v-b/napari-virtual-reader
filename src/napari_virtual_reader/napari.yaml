@@ -2,6 +2,7 @@ name: napari-virtual-reader
 display_name: napari-virtual-reader
 schema_version: 0.2.1
 contributions:
+  # Resolve the reader and Qt widget separately; reader use need not create UI.
   commands:
     - id: napari-virtual-reader.get_reader
       python_name: napari_virtual_reader._reader:napari_get_reader
@@ -12,6 +13,8 @@ contributions:
   readers:
     - command: napari-virtual-reader.get_reader
       accepts_directories: false
+      # Keep aligned with _reader.IMAGE_SUFFIXES. These offer the reader only;
+      # usable OME image metadata and codecs still determine actual support.
       filename_patterns:
         - '*.czi'
         - '*.tif'
@@ -34,4 +37,5 @@ contributions:
         - '*.vzip'
   widgets:
     - command: napari-virtual-reader.widget
+      # This registered dock is reused by both the plugin menu and reader hook.
       display_name: Open Data as virtual OME-ZARR

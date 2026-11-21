@@ -1,17 +1,121 @@
 """Virtual image reader behavior, independent of the Qt widget."""
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import zarr
 
 from napari_virtual_reader._reader import (
+    _czi_rgb_order,
     _layers,
     napari_get_reader,
     read_and_save_image,
     read_images,
 )
+
+
+@pytest.mark.parametrize(
+    ("samples", "dtype"),
+    [(3, "uint8"), (3, "uint16"), (3, "float32"), (4, "uint8")],
+)
+def test_czi_packed_color_scenes_and_pyramids_are_lazy(monkeypatch, samples, dtype):
+    """Keep acquisition channels separate, but assemble their BGR(A) components."""
+    root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
+    root.attrs["refkv_zarrified"] = {"profile": "czi", "version": 0}
+    data = np.arange(2 * samples * 2 * 8 * 10).reshape(2 * samples, 2, 8, 10)
+    data = (data % 200).astype(dtype)
+    for scene in (0, 1):
+        group = root.create_group(str(scene))
+        group.create_array("0", data=data + scene, chunks=(samples, 1, 4, 5))
+        group.create_array(
+            "1", data=(data + scene)[..., ::2, ::2], chunks=(samples, 1, 2, 3)
+        )
+        group.attrs["ome"] = {
+            "multiscales": [{
+                "axes": ["c", "z", "y", "x"],
+                "datasets": [
+                    {
+                        "path": "0",
+                        "coordinateTransformations": [
+                            {"type": "scale", "scale": [1, 2, 0.1, 0.2]},
+                            {"type": "translation", "translation": [0, 0, scene * 10, 5]},
+                        ],
+                    },
+                    {"path": "1"},
+                ],
+            }],
+            "omero": {"channels": [
+                {"label": f"Brightfield {channel} {component}"}
+                for channel in range(2)
+                for component in "BGRA"[:samples]
+            ]},
+        }
+    reads = []
+    getitem = zarr.Array.__getitem__
+
+    def record(array, selection):
+        reads.append(selection)
+        return getitem(array, selection)
+
+    monkeypatch.setattr(zarr.Array, "__getitem__", record)
+    # Recognition uses the profile rather than the suffix, including CZI VZIPs.
+    layers = _layers(root, Path("brightfield.vzip"))
+    assert not reads
+    assert len(layers) == 2
+    order = [2, 1, 0, 3][:samples]
+    for channel, (levels, kwargs, _) in enumerate(layers):
+        assert kwargs["rgb"] is True
+        assert kwargs["axis_labels"] == ("S", "z", "y", "x")
+        assert kwargs["scale"] == (1, 2, 0.1, 0.2)
+        assert kwargs["translate"] == (0, 0, 0, 5)
+        assert kwargs["metadata"]["channel_label"] == f"Brightfield {channel}"
+        assert kwargs["metadata"]["color_components"] == "RGBA"[:samples]
+        assert "colormap" not in kwargs
+        assert kwargs["blending"] == "translucent"
+        assert levels[0].shape == (2, 2, 8, 10, samples)
+        assert levels[0].dtype == np.dtype(dtype)
+        channel_data = data[channel * samples:(channel + 1) * samples]
+        expected = np.stack([
+            np.moveaxis((channel_data + scene)[order], 0, -1) for scene in (0, 1)
+        ])
+        np.testing.assert_array_equal(levels[0].compute(), expected)
+        np.testing.assert_array_equal(levels[1].compute(), expected[..., ::2, ::2, :])
+
+
+@pytest.mark.parametrize("profile", ["czi", "tiff"])
+def test_three_scalar_channels_are_not_rgb(profile):
+    """RGB-looking names and colours are not proof of packed CZI samples."""
+    root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
+    root.attrs["refkv_zarrified"] = {"profile": profile}
+    data = np.arange(3 * 8 * 10, dtype="uint16").reshape(3, 8, 10)
+    root.create_array("0", data=data, chunks=(1 if profile == "czi" else 3, 8, 10))
+    root.attrs["ome"] = {
+        "multiscales": [{"axes": ["c", "y", "x"], "datasets": [{"path": "0"}]}],
+        "omero": {"channels": [
+            {"label": f"Channel {component}", "color": color}
+            for component, color in zip("RGB", ("FF0000", "00FF00", "0000FF"))
+        ]},
+    }
+    layers = _layers(root, Path("image.czi"))
+    assert len(layers) == 3
+    for index, (array, kwargs, _) in enumerate(layers):
+        assert kwargs["rgb"] is False
+        np.testing.assert_array_equal(array.compute(), data[index])
+
+
+@pytest.mark.parametrize("samples", [3, 4])
+@pytest.mark.parametrize("codec", ["bytes", "imagecodecs_jpeg", "imagecodecs_ljpeg", "imagecodecs_jpegxr"])
+def test_czi_component_order_depends_on_decoder(samples, codec):
+    """JPEG decoders already return RGB(A); raw/Zstd bytes remain BGR(A)."""
+    array = SimpleNamespace(
+        shape=(samples, 8, 10), ndim=3, dtype=np.dtype("uint8"),
+        read_chunk_sizes=((samples,), (8,), (10,)),
+        metadata=SimpleNamespace(to_dict=lambda: {"codecs": [{"name": codec}]}),
+    )
+    expected = tuple([2, 1, 0, 3][:samples]) if codec == "bytes" else tuple(range(samples))
+    assert _czi_rgb_order(array, 0) == expected
 
 
 def test_rectilinear_layers_are_lazy(monkeypatch):
@@ -79,6 +183,55 @@ def test_reader_selection():
     assert napari_get_reader(["image.tif", "other.vzip"])
     assert napari_get_reader([]) is None
     assert napari_get_reader("notes.txt") is None
+
+
+@pytest.mark.parametrize(
+    ("profile", "tile_count", "level_count", "warns"),
+    [
+        ("czi", 2, 1, True),
+        ("czi", 2, 2, True),
+        ("czi", 0, 1, False),
+        ("tiff", 2, 1, False),
+    ],
+)
+def test_unassembled_czi_tiles_warn_once_without_pixel_reads(
+    monkeypatch, profile, tile_count, level_count, warns
+):
+    """Warn for partial CZI views, not simply for images with one level."""
+    root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
+    root.attrs["refkv_zarrified"] = {"profile": profile}
+    for level in range(level_count):
+        root.create_array(
+            str(level), shape=(2, 8 // (level + 1), 10 // (level + 1)),
+            chunks=(1, 4, 5), dtype="uint8",
+        )
+    root.attrs["ome"] = {
+        "multiscales": [{
+            "axes": ["c", "y", "x"],
+            "datasets": [{"path": str(level)} for level in range(level_count)],
+        }],
+    }
+    tiles = root.create_group("tiles")
+    for tile in range(tile_count):
+        tiles.create_array(str(tile), shape=(4, 5), dtype="uint8")
+    notifications = []
+    monkeypatch.setattr("napari.utils.notifications.show_warning", notifications.append)
+
+    def forbid_pixels(*args, **kwargs):
+        pytest.fail("Warning detection must not read pixels")
+
+    monkeypatch.setattr(zarr.Array, "__getitem__", forbid_pixels)
+    layers = _layers(root, Path("image.vzip"))
+    assert len(layers) == 2
+    assert len(notifications) == int(warns)
+    for _, kwargs, _ in layers:
+        if warns:
+            assert kwargs["metadata"]["reader_warning"] == notifications[0]
+            assert "2 unassembled tile array(s)" in notifications[0]
+            assert "image.vzip" in notifications[0]
+            assert "napari-czitools" in notifications[0]
+        else:
+            assert "reader_warning" not in kwargs["metadata"]
 
 
 def test_optional_archive_save_is_lazy_and_reopens(tmp_path, monkeypatch):

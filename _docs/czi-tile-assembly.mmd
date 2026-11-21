@@ -1,0 +1,9 @@
+flowchart TD
+    Regular["OME image levels + live factors"] -->|recover native placement| Pieces["Pieces grouped by factor"]
+    Tiles["tiles + placement metadata"] -->|filter scene, axes, channel| Pieces
+    Pieces -->|bound finest level| Extent["Common native extent"]
+    Extent -->|size each level| Mosaic["Mosaic + spatial bins"]
+    Mosaic -->|build without pixel reads| Dask["Lazy Dask pyramid"]
+    Dask -->|request output chunk| Candidates["Intersecting pieces"]
+    Candidates -->|map centres to samples| Read["Bounded Zarr reads"]
+    Read -->|overwrite in source order| Output["Composed output chunk"]
