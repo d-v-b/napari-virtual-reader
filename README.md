@@ -5,7 +5,7 @@ A napari plugin for lazy, reference-backed OME-Zarr images using
 
 ## Remarks
 
-**Experimental software - Alpha status.** APIs and behavior may change without
+**Experimental software - Beta status.** APIs and behavior may change without
 notice. Validate results independently before relying on them for analysis.
 
 Open images without first converting them, writing a pixel copy, or creating
