@@ -39,6 +39,8 @@ is recorded separately from the release preparation date.
 - Prevented the metadata inspector from appearing as a separate dock above
   the file-loading controls.
 - Corrected the package's Beta classifier to the valid PyPI classifier.
+- Replaced the legacy Windows CI OpenGL installer with maintained Mesa setup
+  for GUI validation.
 
 ### Release Status
 
