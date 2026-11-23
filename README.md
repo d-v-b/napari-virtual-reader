@@ -342,9 +342,10 @@ Source guide:
 
 ## Releases
 
-Version [0.0.3](_release_notes/v0.0.3.md) adds lazy 2D CZI mosaic assembly,
-packed-colour CZI handling, a combined loading and metadata dock, and visual
-documentation. The package remains experimental Beta software; review
+Version [0.0.4](_release_notes/v0.0.4.md) adds multidimensional scene canvases,
+native scene navigation, bounded overview caching and load-on-release slider
+dragging. It includes refreshed visual guides and a current-UI screenshot.
+The package remains experimental Beta software; review
 [Scope](#scope) before using it for analysis.
 
 The package workflow tests pull requests and pushes to `main` against
@@ -354,7 +355,8 @@ PyPI publishing
 runs only after its test matrix passes on a pushed tag beginning with `v`;
 use the release convention `vX.Y.Z`.
 
-Set `project.version` in `pyproject.toml` to the intended release version before
+Set `project.version` in `pyproject.toml` and the runtime `__version__` to the
+intended release version before
 tagging; tags do not change the package version. PyPI requires a new
 version for every upload. Manual runs of the package workflow test and build
 without publishing to PyPI. The separate documentation workflow publishes

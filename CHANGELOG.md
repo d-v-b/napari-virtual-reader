@@ -7,6 +7,10 @@ is recorded separately from the release preparation date.
 
 ## Unreleased
 
+No changes yet.
+
+## 0.0.4 - 2026-11-23
+
 ### Added
 
 - Added dock controls to switch CZI scenes between one canvas at their recorded
@@ -53,6 +57,17 @@ is recorded separately from the release preparation date.
 - Simplified channel grouping, scene restoration and canvas-pyramid preparation.
   Centralized metadata refresh batching and documented coordinate conventions,
   lazy overview sampling and reversible scene state, preserving viewing behavior.
+
+### Fixed
+
+- Aligned the runtime package version with the distribution version, 0.0.4.
+
+### Release Status
+
+Release tag: `v0.0.4`. Tag-triggered GitHub Actions validates Linux, Windows and
+macOS with Python 3.12, 3.13 and 3.14 before publishing to PyPI.
+See the [release notes](_release_notes/v0.0.4.md) for highlights, validation
+and known limitations.
 
 ## 0.0.3 - 2026-11-21
 

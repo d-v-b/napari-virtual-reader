@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "napari-virtual-reader"
-version = "0.0.3"
+version = "0.0.4"
 description = "Experimental napari plugin for reading microscopy image file formats, such as CZI as lazy virtual OME-Zarr images via refkv"
 readme = "README.md"
 license = "BSD-3-Clause"

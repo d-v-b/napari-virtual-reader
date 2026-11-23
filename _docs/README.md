@@ -9,8 +9,8 @@ GitHub's repository file viewer shows HTML source; it does not run these pages.
 - [CZI tile assembly](czi-tile-assembly.html): native tile placement and chunk reads,
   plus the separate scene-canvas overview path and bounded cache.
 
-The guides describe the current source checkout, including unreleased scene
-controls. Matching scenes retain one layer per acquisition channel in both
+The guides describe version 0.0.4 and the current source checkout.
+Matching scenes retain one layer per acquisition channel in both
 display modes, including T/Z. Generated overviews share a 64 MiB cache; native
 pixels remain lazy. A selected composed canvas defaults to loading on thumb
 release, with an opt-in live-drag checkbox. Unsupported or nonmatching geometries
