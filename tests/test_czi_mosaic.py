@@ -1,13 +1,15 @@
 """Irregular CZI mosaics stay reference-backed and are composed chunk by chunk."""
 
+import pickle
 from pathlib import Path
 
+import dask.array as da
 import numpy as np
 import pytest
 import zarr
 
-from napari_virtual_reader._czi_mosaic import _Mosaic, _Piece
-from napari_virtual_reader._reader import _layers
+from napari_virtual_reader._czi_mosaic import _Mosaic, _OverviewCache, _Piece
+from napari_virtual_reader._reader import _canvas_czi_layers, _layers
 
 
 def _source(rgb=True):
@@ -173,7 +175,8 @@ def test_unsupported_tiles_remain_visible_as_warning(monkeypatch, unsupported):
     assert "czi_assembly" not in layers[0][1]["metadata"]
 
 
-def test_tile_decode_failure_is_not_replaced_by_black_pixels(monkeypatch):
+@pytest.mark.parametrize("cached", [False, True])
+def test_tile_decode_failure_is_not_replaced_by_black_pixels(monkeypatch, cached):
     array = zarr.array(np.ones((4, 4), dtype="uint8"))
     mosaic = _Mosaic(
         [_Piece(array, 0, 0, 4, 4, 1, 0, (), False)],
@@ -181,6 +184,7 @@ def test_tile_decode_failure_is_not_replaced_by_black_pixels(monkeypatch):
         1,
         np.dtype("uint8"),
         0,
+        overview_cache=_OverviewCache() if cached else None,
     ).lazy()
 
     def fail(*args, **kwargs):
@@ -189,6 +193,105 @@ def test_tile_decode_failure_is_not_replaced_by_black_pixels(monkeypatch):
     monkeypatch.setattr(zarr.Array, "__getitem__", fail)
     with pytest.raises(OSError, match="Source tile unavailable"):
         mosaic.compute()
+
+
+@pytest.mark.parametrize("rgb", [False, True])
+def test_generated_overviews_cache_planes_but_not_native_pixels(monkeypatch, rgb):
+    monkeypatch.setattr("napari_virtual_reader._czi_mosaic._CHUNK_EDGE", 8)
+    layers = []
+    for channel in range(2):
+        for scene in range(2):
+            shape = (2, 2, 4, 4) + ((3,) if rgb else ())
+            data = np.empty(shape, dtype="uint8")
+            for t, z in np.ndindex(2, 2):
+                data[t, z] = 1 + channel * 40 + scene * 10 + t * 2 + z
+            layers.append((
+                da.from_array(data, chunks=(1, 1, 4, 4) + ((3,) if rgb else ())),
+                {
+                    "axis_labels": ("t", "z", "y", "x"),
+                    "scale": (1, 1, 1, 1), "translate": (0, 0, 0, scene * 28),
+                    "rgb": rgb, "multiscale": False,
+                    "metadata": {
+                        "source": "cache.czi", "czi_load_id": "cache",
+                        "series": str(scene), "channel": channel,
+                        "channel_label": f"C{channel}", "multiscale_index": 0,
+                    },
+                },
+                "image",
+            ))
+    reads = []
+    original = _Piece.read
+
+    def record(self, ys, xs, planes=()):
+        reads.append(planes)
+        return original(self, ys, xs, planes)
+
+    monkeypatch.setattr(_Piece, "read", record)
+    canvas = _canvas_czi_layers(layers)
+    assert not reads
+    for channel, (levels, _, _) in enumerate(canvas):
+        for t, z in np.ndindex(2, 2):
+            for level in levels[1:]:
+                reads.clear()
+                first = level[t, z].compute()
+                assert reads
+                assert np.all(first[:, 0] == 1 + channel * 40 + t * 2 + z)
+                assert np.all(first[:, -1] == 11 + channel * 40 + t * 2 + z)
+                width = first.shape[1] // 8
+                assert not first[:, width:-width].any()
+                reads.clear()
+                first[:] = 255
+                again = level[t, z].compute()
+                assert not reads
+                assert not (again == 255).any()
+    # All channel/level/plane entries can coexist without colliding.
+    for levels, _, _ in canvas:
+        for level in levels[1:]:
+            reads.clear()
+            level[0, 0].compute()
+            assert not reads
+        reads.clear()
+        levels[0][0, 0, :4, :4].compute()
+        assert reads
+        reads.clear()
+        levels[0][0, 0, :4, :4].compute()
+        assert reads
+
+
+def test_overview_cache_evicts_least_recent_chunks_and_skips_oversized_entries():
+    cache = _OverviewCache(max_bytes=8)
+    first = ("channel0-level1", ((0, 1, 1),))
+    second = ("channel1-level1", ((0, 1, 1),))
+    third = ("channel0-level2", ((0, 1, 1),))
+    pixels = np.arange(4, dtype="uint8")
+    cache.put(first, pixels)
+    cache.put(second, pixels + 10)
+    pixels[:] = 255
+    np.testing.assert_array_equal(cache.get(first), np.arange(4))
+    cache.put(third, np.arange(4, dtype="uint8") + 20)
+    assert cache.get(second) is None
+    np.testing.assert_array_equal(cache.get(first), np.arange(4))
+    np.testing.assert_array_equal(cache.get(third), np.arange(4) + 20)
+    cache.put(second, np.zeros(9, dtype="uint8"))
+    assert cache.get(second) is None
+    assert cache.get(first) is not None
+    assert cache.get(third) is not None
+    # Replacing an entry must not double-count its bytes or evict its neighbour.
+    cache.put(first, np.arange(4, dtype="uint8") + 30)
+    assert cache.get(third) is not None
+    np.testing.assert_array_equal(cache.get(first), np.arange(4) + 30)
+
+
+def test_cached_overview_graph_remains_serializable():
+    cache = _OverviewCache(max_bytes=8)
+    mosaic = _Mosaic(
+        [_Piece(np.arange(16, dtype="uint8").reshape(4, 4), 0, 0, 4, 4, 1, 0, (), False)],
+        (0, 0, 4, 4), 1, np.dtype("uint8"), 0,
+        shape=(2, 2), overview_cache=cache,
+    ).lazy()
+    expected = mosaic.compute()
+    restored = pickle.loads(pickle.dumps(mosaic))
+    np.testing.assert_array_equal(restored.compute(), expected)
 
 
 def test_scene_tiles_are_not_mixed_and_compatible_mosaics_stack():

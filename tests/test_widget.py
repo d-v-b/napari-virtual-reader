@@ -8,7 +8,9 @@ import dask.array as da
 import numpy as np
 import pytest
 import zarr
-from qtpy.QtCore import Qt
+from qtpy.QtCore import QEvent, QPointF, Qt
+from qtpy.QtGui import QMouseEvent
+from qtpy.QtWidgets import QApplication, QStyle, QStyleOptionSlider
 
 from napari_virtual_reader._reader import _layers
 from napari_virtual_reader._widget import VirtualReaderWidget
@@ -490,18 +492,18 @@ def test_sparse_scene_canvas_has_lazy_overviews_and_bounded_reads():
     assert levels[-1].compute().shape == levels[-1].shape
 
 
-@pytest.mark.parametrize("geometry", ["volume", "rotation"])
+@pytest.mark.parametrize("geometry", ["z_offset", "rotation"])
 def test_scene_canvas_retains_layers_for_unsupported_geometry(geometry):
     from napari_virtual_reader._reader import _canvas_czi_layers
 
-    volume = geometry == "volume"
+    volume = geometry == "z_offset"
     layers = [
         (
             da.zeros((2, 8, 10) if volume else (8, 10), dtype="uint16"),
             {
                 "axis_labels": ("z", "y", "x") if volume else ("y", "x"),
                 "scale": (1, 1, 1) if volume else (1, 1),
-                "translate": (0, 0, index * 10) if volume else (0, index * 10),
+                "translate": (index, 0, index * 10) if volume else (0, index * 10),
                 **({} if volume else {"rotate": np.array([[0, -1], [1, 0]])}),
                 "rgb": False, "multiscale": False,
                 "metadata": {
@@ -515,3 +517,237 @@ def test_scene_canvas_retains_layers_for_unsupported_geometry(geometry):
         for index in range(2)
     ]
     assert _canvas_czi_layers(layers) is layers
+
+
+@pytest.mark.parametrize("axes", [("t",), ("z",), ("t", "z")])
+@pytest.mark.parametrize("rgb", [False, True])
+@pytest.mark.parametrize("multiscale", [False, True])
+def test_scene_canvas_preserves_time_depth_channels_and_roundtrip(
+    make_napari_viewer, monkeypatch, axes, rgb, multiscale,
+):
+    from napari_virtual_reader._reader import _canvas_czi_layers
+
+    viewer = make_napari_viewer()
+    _, widget = viewer.window.add_plugin_dock_widget("napari-virtual-reader")
+    root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
+    root.attrs["refkv_zarrified"] = {"profile": "czi"}
+    plane_shape = (2,) * len(axes)
+    original = {}
+    for scene in range(2):
+        group = root.create_group(str(scene))
+        data = np.arange(
+            np.prod(plane_shape) * 2 * 4 * 6, dtype="uint16",
+        ).reshape(plane_shape + (2, 4, 6)) + scene * 1000
+        original[scene] = data
+        group.create_array("0", data=data, chunks=(1,) * (len(axes) + 1) + (4, 6))
+        datasets = [{
+            "path": "0",
+            "coordinateTransformations": [
+                {"type": "scale", "scale": [2] * len(axes) + [1, 0.5, 0.5]},
+                {
+                    "type": "translation",
+                    "translation": [3] * len(axes) + [0, 5, 10 + scene * 4],
+                },
+            ],
+        }]
+        if multiscale:
+            group.create_array("1", data=data[..., ::2, ::2])
+            datasets.append({"path": "1"})
+        group.attrs["ome"] = {
+            "multiscales": [{
+                "axes": list(axes) + ["c", "y", "x"], "datasets": datasets,
+            }],
+        }
+    prepared = _layers(root, Path("time-volume.czi"), stack_scenes=False)
+    if rgb:
+        prepared = [
+            (
+                [da.stack([level] * 3, axis=-1) for level in data]
+                if multiscale else da.stack([data] * 3, axis=-1),
+                {**kwargs, "rgb": True}, kind,
+            )
+            for data, kwargs, kind in prepared
+        ]
+    reads = []
+    getitem = zarr.Array.__getitem__
+
+    def record(array, key):
+        reads.append((array.path, key))
+        return getitem(array, key)
+
+    monkeypatch.setattr(zarr.Array, "__getitem__", record)
+    canvas = _canvas_czi_layers(prepared)
+    assert len(canvas) == 2
+    assert not reads
+    widget._loaded(prepared)
+    widget.scene_mode.setCurrentText("One canvas")
+    assert len(viewer.layers) == 2
+    for channel, layer in enumerate(viewer.layers):
+        assert layer.axis_labels == axes + ("y", "x")
+        np.testing.assert_allclose(layer.scale, (2,) * len(axes) + (0.5, 0.5))
+        np.testing.assert_allclose(layer.translate, (3,) * len(axes) + (5, 10))
+        levels = layer.data if layer.multiscale else [layer.data]
+        for index, level in enumerate(levels):
+            factor = 2 ** index
+            assert level.shape == plane_shape + (4 // factor, 14 // factor) + (
+                (3,) if rgb else ()
+            )
+            assert level.chunksize[:len(axes)] == (1,) * len(axes)
+            for plane in np.ndindex(plane_shape):
+                pixels = level[plane].compute()
+                for scene in range(2):
+                    expected = original[scene][plane + (channel,)][::factor, ::factor]
+                    if rgb:
+                        expected = np.stack([expected] * 3, axis=-1)
+                    start = scene * 8 // factor
+                    np.testing.assert_array_equal(
+                        pixels[:, start:start + 6 // factor], expected,
+                    )
+                assert not pixels[:, 6 // factor:8 // factor].any()
+    # A single requested plane must not decode other timepoints or Z slices.
+    reads.clear()
+    finest = viewer.layers[0].data[0] if multiscale else viewer.layers[0].data
+    finest[(1,) * len(axes)].compute()
+    assert reads
+    assert all(
+        all(part.start == 1 and part.stop == 2 for part in key[:len(axes)])
+        for _, key in reads
+    )
+    widget.scene_mode.setCurrentText("Scene slider")
+    assert len(viewer.layers) == 2
+    for channel, layer in enumerate(viewer.layers):
+        assert layer.axis_labels == ("S",) + axes + ("y", "x")
+        levels = layer.data if multiscale else [layer.data]
+        for index, level in enumerate(levels):
+            for scene in range(2):
+                expected = original[scene][..., channel, ::2 ** index, ::2 ** index]
+                if rgb:
+                    expected = np.stack([expected] * 3, axis=-1)
+                np.testing.assert_array_equal(level[scene].compute(), expected)
+
+
+@pytest.fixture
+def time_canvas(make_napari_viewer):
+    viewer = make_napari_viewer()
+    _, widget = viewer.window.add_plugin_dock_widget("napari-virtual-reader")
+    layers = [
+        (
+            da.full((31, 31, 4, 6), scene, chunks=(1, 1, 4, 6), dtype="uint8"),
+            {
+                "axis_labels": ("t", "z", "y", "x"), "scale": (1,) * 4,
+                "translate": (0, 0, 0, scene * 8),
+                "rgb": False, "multiscale": False,
+                "metadata": {
+                    "source": "time-volume.czi", "czi_load_id": "time-volume",
+                    "series": str(scene), "channel": 0, "channel_label": "C0",
+                    "multiscale_index": 0,
+                },
+            },
+            "image",
+        )
+        for scene in range(2)
+    ]
+    widget._loaded(layers)
+    widget.scene_mode.setCurrentText("One canvas")
+    return viewer, widget
+
+
+@pytest.mark.parametrize("axis", [0, 1], ids=["time", "depth"])
+@pytest.mark.parametrize("live", [False, True], ids=["release-only", "live"])
+def test_canvas_mouse_drag_commits_only_requested_positions(qtbot, time_canvas, axis, live):
+    viewer, widget = time_canvas
+    widget.update_while_dragging.setChecked(live)
+    viewer.dims.set_current_step(axis, 30)
+    viewer.window._qt_window.show()
+    dim = viewer.window._qt_viewer.dims.slider_widgets[axis]
+    slider = dim.slider
+    qtbot.waitExposed(slider)
+    options = QStyleOptionSlider()
+    slider.initStyleOption(options)
+    style = slider.style()
+    groove = style.subControlRect(
+        QStyle.CC_ScrollBar, options, QStyle.SC_ScrollBarGroove, slider,
+    )
+    handle = style.subControlRect(
+        QStyle.CC_ScrollBar, options, QStyle.SC_ScrollBarSlider, slider,
+    )
+    steps = []
+    viewer.dims.events.current_step.connect(
+        lambda event: steps.append(viewer.dims.current_step[axis])
+    )
+    qtbot.mousePress(slider, Qt.LeftButton, pos=handle.center())
+    for target in (29, 20, 10):
+        x = groove.x() + QStyle.sliderPositionFromValue(
+            0, 30, target, groove.width() - handle.width(), options.upsideDown,
+        ) + handle.width() // 2
+        position = handle.center()
+        position.setX(x)
+        event = QMouseEvent(
+            QEvent.MouseMove, QPointF(position),
+            QPointF(slider.mapToGlobal(position)),
+            Qt.NoButton, Qt.LeftButton, Qt.NoModifier,
+        )
+        QApplication.sendEvent(slider, event)
+        assert slider.sliderPosition() == target
+        assert dim.curslice_label.text() == str(target)
+        assert viewer.dims.current_step[axis] == (target if live else 30)
+        if not live:
+            assert not steps
+    qtbot.mouseRelease(slider, Qt.LeftButton, pos=position)
+    assert steps == ([29, 20, 10] if live else [10])
+    qtbot.keyClick(slider, Qt.Key_Left)
+    keyboard_step = viewer.dims.current_step[axis]
+    assert abs(keyboard_step - 10) == 1
+    dim.curslice_label.selectAll()
+    qtbot.keyClicks(dim.curslice_label, "7")
+    assert viewer.dims.current_step[axis] == keyboard_step
+    qtbot.keyClick(dim.curslice_label, Qt.Key_Return)
+    assert viewer.dims.current_step[axis] == 7
+
+
+def test_canvas_tracking_policy_restores_sliders_and_handles_recreation(qtbot, time_canvas):
+    viewer, widget = time_canvas
+    canvas = viewer.layers.selection.active
+    viewer.window._qt_window.show()
+    qtbot.waitExposed(widget)
+
+    def tracking():
+        return [
+            dim.slider.hasTracking()
+            for dim in viewer.window._qt_viewer.dims.slider_widgets
+        ]
+
+    assert widget.update_while_dragging.isEnabled()
+    assert not any(tracking())
+    unrelated = viewer.add_image(np.zeros((2, 2, 2, 4, 6)))
+    assert not widget.update_while_dragging.isEnabled()
+    assert all(tracking())
+    viewer.layers.selection.active = canvas
+    assert not any(tracking())
+    viewer.layers.remove(unrelated)
+    assert len(tracking()) == 4
+    assert not any(tracking())
+    widget.close()
+    assert all(tracking())
+    widget.show()
+    assert not any(tracking())
+    widget.scene_mode.setCurrentText("Scene slider")
+    assert all(tracking())
+    assert not widget.update_while_dragging.isEnabled()
+    viewer.dims.set_current_step(0, 0)
+    widget.scene_number.lineEdit().selectAll()
+    qtbot.keyClicks(widget.scene_number, "2")
+    assert viewer.dims.current_step[0] == 0
+    qtbot.keyClick(widget.scene_number, Qt.Key_Return)
+    assert viewer.dims.current_step[0] == 1
+    qtbot.keyClick(widget.scene_number, Qt.Key_Down)
+    assert viewer.dims.current_step[0] == 0
+    widget.scene_mode.setCurrentText("One canvas")
+    assert not any(tracking())
+    widget.update_while_dragging.setChecked(True)
+    assert all(tracking())
+    widget.update_while_dragging.setChecked(False)
+    assert not any(tracking())
+    viewer.layers.clear()
+    assert not widget._dimension_sliders
+    assert all(tracking())

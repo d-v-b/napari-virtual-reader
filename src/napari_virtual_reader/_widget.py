@@ -7,15 +7,18 @@ The embedded MetadataPanel follows selection independently of the open action.
 """
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import napari
 import numpy as np
+from napari._qt.widgets.qt_dims import QtDims
 from napari.layers import Image
 from napari.qt.threading import create_worker
 from napari.utils.transforms import CompositeAffine
-from qtpy.QtCore import QSignalBlocker, Qt, Slot
+from qtpy.QtCore import QEvent, QObject, QSignalBlocker, Qt, Slot
+from qtpy.QtGui import QMouseEvent
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -26,6 +29,7 @@ from qtpy.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollBar,
     QSlider,
     QSpinBox,
     QStyle,
@@ -89,6 +93,9 @@ class VirtualReaderWidget(QWidget):
         self._archive_path = None
         self._scene_views: dict[str, _SceneView] = {}
         self._updating_scenes = False
+        self._dimension_sliders: dict[
+            QScrollBar, tuple[bool, QLineEdit, Callable[..., None]]
+        ] = {}
         self.setMinimumWidth(260)
         self.setAcceptDrops(True)
         layout = QVBoxLayout(self)
@@ -142,6 +149,7 @@ class VirtualReaderWidget(QWidget):
         self.scene_number.setRange(1, 1)
         self.scene_number.setPrefix("Scene ")
         self.scene_number.setAccessibleName("CZI scene number")
+        self.scene_number.setKeyboardTracking(False)
         self.scene_number.valueChanged.connect(
             lambda number: self._scene_changed(number - 1)
         )
@@ -150,6 +158,14 @@ class VirtualReaderWidget(QWidget):
         row.addWidget(self.scene_number)
         row.addWidget(self.scene_label)
         layout.addLayout(row)
+        self.update_while_dragging = QCheckBox("Update while dragging")
+        self.update_while_dragging.setToolTip(
+            "While a CZI canvas is selected, update this viewer's dimension "
+            "sliders continuously. When off, dragging previews the index and "
+            "loads only on release. Keys and committed numeric entries load immediately."
+        )
+        self.update_while_dragging.toggled.connect(self._sync_dimension_sliders)
+        layout.addWidget(self.update_while_dragging)
         self.metadata_panel = MetadataPanel(viewer)
         # Keep loading controls compact at the top; the inspector gets extra height.
         layout.addWidget(self.metadata_panel, stretch=1)
@@ -157,6 +173,7 @@ class VirtualReaderWidget(QWidget):
         viewer.layers.events.inserted.connect(self._sync_scene_controls)
         viewer.layers.events.removed.connect(self._scene_removed)
         viewer.dims.events.current_step.connect(self._native_scene_changed)
+        viewer.dims.events.ndim.connect(self._sync_dimension_sliders)
         self._sync_scene_controls()
         self._update_open()
 
@@ -197,6 +214,7 @@ class VirtualReaderWidget(QWidget):
     def _sync_scene_controls(self, event=None) -> None:
         if self._updating_scenes:
             return
+        self._sync_dimension_sliders()
         layers = self._scene_layers()
         scenes = _scene_ids(layers)
         self.scene_mode.setEnabled(len(scenes) > 1)
@@ -233,6 +251,67 @@ class VirtualReaderWidget(QWidget):
             f"/ {len(scenes)} (series {scenes[view.index]})"
         )
         self._apply_scene_view(layers, scenes, view)
+
+    def _sync_dimension_sliders(self, event=None) -> None:
+        if self._updating_scenes:
+            return
+        canvas = not self._closed and any(
+            layer.metadata.get("czi_scene_canvas") for layer in self._scene_layers()
+        )
+        self.update_while_dragging.setEnabled(canvas)
+        # napari exposes no public API for its dimension-slider tracking.
+        widgets = []
+        if canvas:
+            dims = self.viewer.window._qt_window.findChild(QtDims)
+            if dims is None:
+                raise RuntimeError("napari dimension controls are unavailable")
+            widgets = dims.slider_widgets
+        current = {widget.slider for widget in widgets}
+        for slider, (tracking, label, forget) in tuple(self._dimension_sliders.items()):
+            if slider not in current:
+                slider.removeEventFilter(self)
+                slider.sliderMoved.disconnect(self._preview_dimension)
+                slider.destroyed.disconnect(forget)
+                slider.setTracking(tracking)
+                label.setText(str(slider.value()))
+                del self._dimension_sliders[slider]
+        for widget in widgets:
+            slider = widget.slider
+            if slider not in self._dimension_sliders:
+                def forget_slider(_=None, slider=slider) -> None:
+                    self._dimension_sliders.pop(slider, None)
+
+                self._dimension_sliders[slider] = (
+                    slider.hasTracking(), widget.curslice_label, forget_slider,
+                )
+                slider.installEventFilter(self)
+                slider.sliderMoved.connect(self._preview_dimension)
+                slider.destroyed.connect(forget_slider)
+            slider.setTracking(self.update_while_dragging.isChecked())
+
+    def _preview_dimension(self, position: int) -> None:
+        slider = self.sender()
+        if (
+            isinstance(slider, QScrollBar)
+            and slider in self._dimension_sliders
+            and not slider.hasTracking()
+        ):
+            self._dimension_sliders[slider][1].setText(str(position))
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if (
+            isinstance(watched, QScrollBar)
+            and watched in self._dimension_sliders
+            and not watched.hasTracking()
+            and watched.isSliderDown()
+            and isinstance(event, QMouseEvent)
+            and event.type() == QEvent.Type.MouseMove
+        ):
+            # napari's move override calls setValue even with tracking off.
+            # Qt's native move handler previews the thumb and commits on release.
+            QScrollBar.mouseMoveEvent(watched, event)
+            return True
+        return super().eventFilter(watched, event)
 
     def _apply_scene_view(
         self, layers: list[Image], scenes: list[str], view: _SceneView,
@@ -599,4 +678,10 @@ class VirtualReaderWidget(QWidget):
     def closeEvent(self, event) -> None:
         """Discard worker results if the dock is closed during preparation."""
         self._closed = True
+        self._sync_dimension_sliders()
         super().closeEvent(event)
+
+    def showEvent(self, event) -> None:
+        self._closed = False
+        self._sync_dimension_sliders()
+        super().showEvent(event)

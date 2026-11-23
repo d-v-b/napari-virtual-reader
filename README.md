@@ -18,19 +18,20 @@ or the napari-czitools plugin.
 This README describes the source checkout. Published releases may not yet include
 all features below; see the [changelog](CHANGELOG.md) for unreleased changes.
 
-The screenshots show the earlier two-dock layout. The current UI combines the
-loading controls and metadata inspector in one dock.
+The current UI combines loading controls, scene navigation and the metadata
+inspector in one dock. The canvas below retains one layer per channel and a
+time slider; **Update while dragging** is off by default.
 
-<img src="https://raw.githubusercontent.com/sebi06/napari-virtual-reader/main/_images/czi_virtual_omezarr1.png" alt="CZI image displayed in napari with the earlier separate opener and metadata docks" style="width:80%; height:auto;">
+<img src="https://raw.githubusercontent.com/sebi06/napari-virtual-reader/main/_images/czi_scene_canvas.png" alt="Current combined dock with a two-channel, multi-scene CZI canvas, time slider and Update while dragging option" style="width:100%; height:auto;">
 
 ## Visual guides
 
 - [How the plugin works](https://sebi06.github.io/napari-virtual-reader/plugin-workflow.html):
-  lazy loading, the combined dock, scene sliders, single-layer canvases, metadata
-  and VZIP archives.
+  lazy loading, the combined dock, release-only slider dragging, scene controls,
+  multidimensional canvases, metadata and VZIP archives.
 - [How CZI tile assembly works](https://sebi06.github.io/napari-virtual-reader/czi-tile-assembly.html):
   tile placement, chunk reads, coordinate mapping, stored tile pyramids,
-  lazy scene-canvas overviews and limitations.
+  lazy scene-canvas overviews, bounded overview caching and limitations.
 
 These links open rendered HTML on GitHub Pages, not GitHub's HTML source viewer.
 The editable sources and standalone pages are in [_docs](_docs/);
@@ -70,9 +71,9 @@ The plugin is also listed on
   between stored resolution levels as you zoom, without loading the whole image
   or writing a converted copy.
 - **Multiple scenes:** choose **One canvas** or **Scene slider** in the dock.
-  Matching 2D scenes retain one layer per channel in both modes. Nonmatching
-  scenes keep individual layers without forced padding or resampling. Use
-  napari's native S slider or the dock's scene-number up/down controls.
+  Matching scenes retain one layer per channel in both modes, including T/Z
+  dimensions. Nonmatching scenes keep individual layers without forced padding
+  or resampling. Use napari's native S slider or the dock's scene-number controls.
 
 **Why assembly helps:** refkv can expose irregular or overlapping CZI tiles
 separately from its regular image levels. Reading only those levels can omit
@@ -154,6 +155,25 @@ plugin from the menu before or after a reader load reuses the dock rather than
 creating a second panel. A new reader load also reopens the dock if it was hidden.
 The inspector follows the selected image layer, independently of how it was loaded.
 
+### Dimension slider updates
+
+With a composed CZI canvas selected, **Update while dragging** is off by default.
+Drag a dimension-slider thumb, such as T or Z, to preview its numeric index
+without changing the displayed image. Releasing the thumb requests only the
+final position, rather than calculating every intermediate frame.
+
+Enable **Update while dragging** for continuous image updates. Keyboard steps,
+scrollbar step/page clicks, committed numeric entries and playback retain their
+normal immediate updates. Napari's numeric fields commit on Enter or focus loss;
+the dock's scene-number field also waits for committed entry rather than loading
+each digit.
+
+Napari's dimension sliders are shared by all layers in a viewer, so this option
+affects that viewer while a composed CZI canvas is selected. Selecting another
+source, leaving composed canvas mode or closing the plugin widget restores the
+previous tracking behavior. The option is disabled outside a composed canvas.
+It does not enable background prefetch or change the overview-cache policy.
+
 ### CZI scene display
 
 Select a layer from a multi-scene CZI, then use **CZI scenes** in the dock:
@@ -162,8 +182,9 @@ Select a layer from a multi-scene CZI, then use **CZI scenes** in the dock:
   acquisition channel with a real napari **S** dimension. Matching single-channel
   files with 28 scenes therefore open as one layer, not 28 layers. Move napari's
   S slider or use the dock's **Scene** number field and its up/down arrows.
-- **One canvas**: matching 2D scenes share one lazy spatial canvas per acquisition
-  channel, at their recorded positions. Switching a matching 28-scene,
+- **One canvas**: matching scenes share one lazy Y/X spatial canvas per acquisition
+  channel, at their recorded positions, retaining T and Z sliders when present.
+  Switching a matching 28-scene,
   single-channel file therefore keeps **one layer in both modes**. Incompatible
   scenes retain individual layers at their physical positions; this is their
   default display mode.
@@ -180,9 +201,19 @@ chunks. Gaps are zero and later numeric scenes win overlaps. Fractional scene
 positions use nearest-neighbour sampling on the canvas pixel grid. Lazy
 nearest-neighbour overview levels are added when needed for large, sparse
 canvases; switching back to S restores the original scene arrays and pyramids.
+Generated overview chunks are cached on demand in a shared **64 MiB in-memory
+LRU cache per canvas load**, across channels and overview levels. Revisiting a
+cached timepoint or Z slice avoids rereading its source images; first visits
+still need source reads. Full-resolution and stored pyramid levels are not
+cached by this mechanism. Cache entries are evicted as the budget is reached;
+switching back to canvas mode creates a fresh cache. There is no background
+prefetch or disk cache.
 No full canvas or converted pixel copy is allocated or written during preparation.
-Combined canvases currently require matching 2D Y/X scenes without rotation or
-shear. Other dimensionalities or transformed scenes retain separate layers.
+Combined canvases support S/T/C/Z/Y/X data: S is composed spatially in Y/X, C
+remains separate layers, and T/Z remain lazy dimensions, chunked one plane at a
+time. Scenes must match in shape, calibration and pyramid structure and share
+T/Z origins, without rotation, shear or extra affine transforms. Unsupported
+scenes retain separate layers.
 
 Switch modes after loading without reopening the file. Display-mode changes
 apply to the selected layer's source load; other images and repeated loads of
@@ -206,7 +237,10 @@ controls require multiple OME image series exposed by refkv.
 - A filter finds matching properties; selecting a row shows its complete,
   selectable value below the tree.
 
-<img src="https://raw.githubusercontent.com/sebi06/napari-virtual-reader/main/_images/czi_virtual_omezarr2.png" alt="Zarr structure and image metadata in the earlier separate metadata dock" style="width:80%; height:auto;">
+The older screenshot below illustrates metadata contents; it shows the
+historical separate-dock layout, not the current controls.
+
+<img src="https://raw.githubusercontent.com/sebi06/napari-virtual-reader/main/_images/czi_virtual_omezarr2.png" alt="Historical screenshot illustrating metadata contents in the earlier separate metadata dock" style="width:80%; height:auto;">
 
 The inspector uses a metadata-only snapshot collected during reader preparation
 (in the background when using the plugin's **Open** button). It does not scan
@@ -255,7 +289,7 @@ Selecting an unrelated layer clears the inspector.
   raw/Zstd/LZW BGR(A) is reordered, while JPEG/JPEG-XR RGB(A) is retained.
   Complex-valued packed-colour CZI pixels are not supported.
 - GUI loads compact compatible CZI scenes into one layer per channel with a
-  leading **S** axis; matching 2D scenes also use one lazy spatial canvas per
+  leading **S** axis; matching scenes also use one lazy spatial canvas per
   channel in canvas mode without reopening the source. Incompatible scenes retain the
   separate-layer dock slider. Other formats retain separate series layers
   without CZI scene controls. Scripted `read_images(path)` calls also stack

@@ -5,13 +5,17 @@ browser, or read them on [GitHub Pages](https://sebi06.github.io/napari-virtual-
 GitHub's repository file viewer shows HTML source; it does not run these pages.
 
 - [Plugin workflow](plugin-workflow.html): combined dock, native S navigation,
-  scene-number arrows, compact spatial canvases, metadata and VZIP archives.
+  release-only dimension dragging, multidimensional canvases, metadata and VZIP.
 - [CZI tile assembly](czi-tile-assembly.html): native tile placement and chunk reads,
-  plus the separate scene-canvas overview path.
+  plus the separate scene-canvas overview path and bounded cache.
 
 The guides describe the current source checkout, including unreleased scene
-controls. Matching 2D scenes retain one layer per acquisition channel in both
-display modes; unsupported or nonmatching geometries retain separate layers.
+controls. Matching scenes retain one layer per acquisition channel in both
+display modes, including T/Z. Generated overviews share a 64 MiB cache; native
+pixels remain lazy. A selected composed canvas defaults to loading on thumb
+release, with an opt-in live-drag checkbox. Unsupported or nonmatching geometries
+retain separate layers. Historical release notes and older labelled screenshots
+describe their original releases rather than the current checkout.
 
 ## Editing and rendering
 

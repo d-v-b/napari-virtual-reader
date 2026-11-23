@@ -63,7 +63,11 @@ flowchart TD
     Layers -->|route supported CZI| CZI
     Layers -->|keep other formats| View["napari image layers"]
     CZI -->|stack compatible scenes| View
+    View <-->|switch matching CZI scenes| Canvas["Canvas: T/Z + spatial Y/X"]
+    Canvas -->|release thumb by default| Plane["Chosen T/Z plane"]
+    Plane -->|reuse generated overviews| Cache["64 MiB overview LRU"]
     View -->|select layer| Metadata["Metadata inspector"]
+    Canvas -->|select layer| Metadata
 </pre></div>
 <figcaption><span class="fig-n">Fig. 2</span>Only a raw CZI supplies the live calibration summary used for new tile assembly.</figcaption>
 </figure>
@@ -74,7 +78,7 @@ flowchart TD
 <div class="boundary-note"><strong>CZI-only assembly.</strong> Other formats bypass this extra path. They can still display images and pyramids already exposed by refkv, but this plugin does not yet assemble their separate irregular tile arrays.</div>
 <div class="split">
 <div><h3>Colour is not a channel count</h3><p>CZI packed BGR(A) samples become one RGB(A) layer. Codec-aware ordering retains already-decoded RGB. Scalar fluorescence channels stay separate.</p></div>
-<div><h3>Matching scenes share a layer</h3><p>Compatible CZI scenes open on a native <code>S</code> axis. Matching 2D scenes also share one spatial canvas per channel. Other geometries retain separate scene layers.</p></div>
+<div><h3>Matching scenes share a layer</h3><p>Compatible CZI scenes open on a native <code>S</code> axis. Matching scenes also share one spatial canvas per channel, retaining T/Z dimensions. Unsupported geometries retain separate scene layers.</p></div>
 </div>
 <p>Registered filename extensions offer the reader; they do not guarantee that refkv can parse the file or decode its codecs.</p>
 </section>
@@ -90,6 +94,8 @@ flowchart TD
 <p class="ve-label">Progress and status</p>
 <div class="control">CZI scenes: One canvas / Scene slider</div>
 <div class="control">Scene number: type or use up/down arrows</div>
+<div class="control">[ ] Update while dragging</div>
+<p class="ve-label">Selected canvas: preview T/Z index while dragging;<br>request the final frame on release.</p>
 <p class="ve-label">Native S stack: napari slider + dock number.<br>Separate scenes: dock slider + number.</p>
 <div class="inspector"><h3>Selected layer metadata</h3><p>Zarr structure / Metadata</p><div class="control">Filter properties</div><pre>source
 series / channel
@@ -137,15 +143,30 @@ reader_warning (when present)</pre></div>
 <text class="note" x="635" y="318">Canvas: show together</text><text class="note" x="635" y="345">Dock slider: show one</text>
 <text class="note" x="30" y="378">Schematic layouts, not measured scene positions. Repeat per acquisition channel.</text>
 </svg></div>
-<figcaption><span class="fig-n">Fig. 4</span>Scene-slider and canvas modes retain one layer per channel for matching 2D scenes; incompatible scenes stay separate.</figcaption>
+<figcaption><span class="fig-n">Fig. 4</span>Both modes retain one layer per channel for matching scenes, including T/Z; incompatible scenes stay separate.</figcaption>
 </figure>
 <p>Matching scenes open with napari's native <code>S</code> slider. The dock's 1-based scene-number field supports direct entry and up/down arrows. Native S indices are 0-based; both controls stay synchronized.</p>
-<p>Switch to <strong>One canvas</strong> to see all matching 2D scenes at their recorded positions. Switch back to restore the original scene arrays, pyramid levels and selected scene. No source reopening or saved pixel copy is needed.</p>
+<p>Switch to <strong>One canvas</strong> to see all matching scenes at their recorded Y/X positions, with T/Z sliders retained. S becomes spatial placement and C remains separate layers. Switch back to restore original scene arrays, pyramid levels and the selected scene.</p>
+<figure>
+<div class="frame"><svg class="ve-svg" viewBox="0 0 900 245" role="img" aria-label="With live dragging off, moving from time 30 to 10 only previews the index. Releasing requests time 10.">
+<text class="ve-tag" x="30" y="30">UPDATE WHILE DRAGGING / OFF BY DEFAULT FOR A SELECTED CANVAS</text>
+<path class="ve-e" d="M250 100H345"/><text class="ve-el" x="297" y="80">previews</text>
+<path class="ve-e is-hot" d="M565 100H660"/><text class="ve-el" x="612" y="80">releases</text>
+<g class="ve-n"><rect class="sh" x="30" y="65" width="220" height="75"/><text x="140" y="91">Drag T: 30 to 10</text><text class="sub" x="140" y="118">no intermediate reads</text></g>
+<g class="ve-n"><rect class="sh" x="345" y="65" width="220" height="75"/><text x="455" y="91">Index shows 10</text><text class="sub" x="455" y="118">image stays at T=30</text></g>
+<g class="ve-n is-key"><rect class="sh" x="660" y="65" width="210" height="75"/><text x="765" y="91">Request T=10</text><text class="sub" x="765" y="118">one chosen position</text></g>
+<text class="note" x="30" y="185">Keys, step/page clicks, committed numeric entry and playback stay immediate.</text>
+<text class="note" x="30" y="215">Enable live dragging to request intermediate positions again.</text>
+</svg></div>
+<figcaption><span class="fig-n">Fig. 5</span>Release-only dragging avoids starting a new frame calculation at each intermediate thumb position.</figcaption>
+</figure>
 <div class="split">
-<div><h3>One spatial canvas when safe</h3><p>Scenes need the same axes, shape, dtype, scale, pyramid depth and channel membership. Combined canvases currently support Y/X scenes without rotation or shear. Gaps are zero; later numeric scenes win overlaps.</p></div>
+<div><h3>One spatial canvas when safe</h3><p>Scenes need the same axes, shape, dtype, scale, pyramid depth and channel membership. S/T/C/Z/Y/X canvases require shared T/Z origins and no rotation, shear or extra affine transforms. Gaps are zero; later numeric scenes win overlaps.</p></div>
 <div><h3>Separate layers when needed</h3><p>Nonmatching scenes keep their own shapes and pyramids. The dock slider and scene-number field show one scene at a time; canvas mode shows them together. Independent scene/channel visibility can also prevent stacking.</p></div>
 </div>
 <p>Large sparse canvases gain lazy nearest-neighbour overviews. Fractional scene positions also use nearest-neighbour canvas sampling. This is display composition, not registration, and it does not recover missing native data.</p>
+<p>Generated overview chunks share a 64 MiB in-memory least-recently-used cache across channels and levels. First visits still read source images. Cached revisits avoid those reads; native and stored levels remain uncached. Mode conversion creates a fresh cache. There is no background prefetch.</p>
+<p>The dragging option applies to this viewer's shared dimension controls while a composed CZI canvas is selected. Other selections, leaving composed mode or closing the widget restore previous tracking. Numeric entry commits on Enter or focus loss.</p>
 <p>Mode changes apply to the active source load. Native S stacks follow napari's shared dimension controls; separate-layer dock sliders retain independent scene indices.</p>
 </section>
 <section id="archive">
@@ -160,7 +181,7 @@ reader_warning (when present)</pre></div>
 <g class="ve-n"><rect class="sh" x="650" y="50" width="190" height="70"/><text x="745" y="76">VZIP archive</text><text class="sub" x="745" y="100">optional file</text></g>
 <text class="ve-tag" x="30" y="240">Not a portable, self-contained pixel backup.</text>
 </svg></div>
-<figcaption><span class="fig-n">Fig. 5</span>Saving preserves refkv's reference layout, not the plugin's runtime CZI mosaic or live pyramid-factor summary.</figcaption>
+<figcaption><span class="fig-n">Fig. 6</span>Saving preserves refkv's reference layout, not the plugin's runtime CZI mosaic, overview cache or live pyramid-factor summary.</figcaption>
 </figure>
 <p>Choose the original CZI for mosaic assembly. Reopened VZIPs may show only regular levels and warn about remaining tiles. Source access must also be permitted by refkv's policy.</p>
 <p>Saving stages the archive before publishing it. Replacing an existing destination requires confirmation; a failed write preserves the old archive. Cancelling the save dialog cancels that open action.</p>
@@ -173,7 +194,7 @@ reader_warning (when present)</pre></div>
 <div class="case" data-st="warn"><span class="chip warn">Incomplete CZI</span><h3>Unsupported tiles remain</h3><svg class="ve-mini" viewBox="0 0 260 100" role="img" aria-label="Remaining tiles are omitted and produce a warning"><rect class="ve-slot is-on" x="20" y="20" width="50" height="50"/><rect class="ve-slot" x="80" y="20" width="50" height="50"/><text class="ve-tag" x="145" y="50">Warning</text></svg></div>
 <div class="case" data-st="risk"><span class="chip risk">Explicit failure</span><h3>No supported OME image</h3><svg class="ve-mini" viewBox="0 0 260 100" role="img" aria-label="No supported OME image produces an error, not a guessed image"><path class="guide" d="M20 50H220"/><path class="guide" d="M110 30L150 70M110 70L150 30"/><text class="ve-tag" x="20" y="90">No image layer</text></svg></div>
 </div>
-<figcaption><span class="fig-n">Fig. 6</span>A pyramid alone is not evidence that native resolution or every source tile is displayed.</figcaption>
+<figcaption><span class="fig-n">Fig. 7</span>A pyramid alone is not evidence that native resolution or every source tile is displayed.</figcaption>
 </figure>
 <p>Supported 2D CZI mosaics use deterministic tile placement, not registration or blending. This plugin does not use czitools or libCZI as a fallback.</p>
 <p>The incomplete-tile warning is also CZI-specific. No warning for another format is not proof of a complete view.</p>

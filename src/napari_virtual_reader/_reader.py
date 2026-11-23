@@ -270,17 +270,20 @@ def _read_gui_images(path: str | list[str]) -> list[LayerData]:
 
 
 def _canvas_czi_layers(layers: list[LayerData]) -> list[LayerData]:
-    """Compose matching 2D scenes in bounded chunks, retaining their footprints."""
-    from ._czi_mosaic import compose_scene_canvas
+    """Compose scenes in Y/X, retaining T/Z axes and separate channel layers."""
+    from ._czi_mosaic import _OverviewCache, compose_scene_canvas
 
     compact = _compact_czi_layers(layers)
     if not compact or any(
         "scenes" not in kwargs["metadata"]
-        or tuple(kwargs["axis_labels"]) != ("S", "y", "x")
+        or tuple(kwargs["axis_labels"])[-2:] != ("y", "x")
+        or kwargs["axis_labels"][0] != "S"
+        or any(axis not in ("t", "z") for axis in kwargs["axis_labels"][1:-2])
         for _, kwargs, _ in compact
     ):
         return layers
     result = []
+    overview_cache = _OverviewCache()
     for _, stacked_kwargs, _ in compact:
         metadata = stacked_kwargs["metadata"]
         scenes = [
@@ -289,14 +292,16 @@ def _canvas_czi_layers(layers: list[LayerData]) -> list[LayerData]:
             and layer[1]["metadata"]["multiscale_index"] == metadata["multiscale_index"]
         ]
         first = scenes[0][1]
+        ndim = len(first["axis_labels"])
         # A rotated scene cannot be placed by an axis-aligned source rectangle.
         if any(
-            not np.allclose(kwargs.get("rotate", np.eye(2)), np.eye(2))
+            not np.allclose(kwargs.get("rotate", np.eye(ndim)), np.eye(ndim))
             or not np.allclose(kwargs.get("shear", 0), 0)
             or (
                 "affine" in kwargs
-                and not np.allclose(kwargs["affine"].linear_matrix, np.eye(2))
+                and not np.allclose(kwargs["affine"].affine_matrix, np.eye(ndim + 1))
             )
+            or not np.array_equal(kwargs["translate"][:-2], first["translate"][:-2])
             for _, kwargs, _ in scenes
         ):
             return layers
@@ -308,6 +313,7 @@ def _canvas_czi_layers(layers: list[LayerData]) -> list[LayerData]:
             origins=np.asarray([kwargs["translate"] for _, kwargs, _ in scenes]),
             scale=np.asarray(first["scale"]),
             rgb=first["rgb"],
+            overview_cache=overview_cache,
         )
         result.append((
             canvases if len(canvases) > 1 else canvases[0],

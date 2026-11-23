@@ -8,4 +8,8 @@ flowchart TD
     Layers -->|route supported CZI| CZI
     Layers -->|keep other formats| View["napari image layers"]
     CZI -->|stack compatible scenes| View
+    View <-->|switch matching CZI scenes| Canvas["Canvas: T/Z + spatial Y/X"]
+    Canvas -->|release thumb by default| Plane["Chosen T/Z plane"]
+    Plane -->|reuse generated overviews| Cache["64 MiB overview LRU"]
     View -->|select layer| Metadata["Metadata inspector"]
+    Canvas -->|select layer| Metadata

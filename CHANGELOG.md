@@ -19,13 +19,24 @@ is recorded separately from the release preparation date.
   Both the opener and File/Open compact layers before insertion. The dock
   switches between the native S stack and the spatial canvas without reopening;
   incompatible scenes retain the separate-layer dock slider.
-- Matching 2D scenes also keep one layer per channel in **One canvas**, using
+- Matching scenes also keep one layer per channel in **One canvas**, using
   lazy, chunk-local spatial composition instead of expanding to one layer per
   scene. Preserve the original arrays for S-stack restoration. Sparse canvases
   gain lazy overview levels to avoid allocating their full spatial extent.
   Gaps are zero and later numeric scenes win overlaps; fractional positions
   use nearest-neighbour sampling. Nonmatching or unsupported geometries retain
   separate layers.
+- Extended composed canvases to S/T/C/Z/Y/X data: compose S spatially in Y/X,
+  keep C as separate acquisition-channel layers, and retain T/Z sliders with
+  one plane per output chunk. T/Z origins must agree across matching scenes.
+- Added a shared, byte-bounded 64 MiB in-memory LRU cache for generated scene
+  overviews. Revisiting cached T/Z chunks avoids source reads; native/stored
+  levels remain uncached, and first visits still read the source. There is no
+  background prefetch or disk cache.
+- Added **Update while dragging**, off by default for a selected composed CZI
+  canvas. Dimension-thumb dragging previews the index and loads only on release;
+  opt in for continuous updates. Keyboard, committed numeric entry and playback
+  remain immediate. Restore prior slider tracking outside the canvas context.
 - Added a synchronized, 1-based scene-number field with up/down arrows, keyboard
   controls and direct entry beside the dock slider. It also controls native S
   stacks, without duplicating napari's slider.
@@ -35,7 +46,10 @@ is recorded separately from the release preparation date.
 ### Changed
 
 - Updated both README-linked visual guides and their index for native scene
-  navigation, scene-number arrows, compact canvases and lazy display overviews.
+  navigation, multidimensional canvases, overview caching and release-only
+  dragging. Refreshed the current-UI screenshot and read-path diagram.
+- Commit typed dock scene numbers on Enter or focus loss instead of loading
+  intermediate digits; step buttons and arrow keys remain immediate.
 - Simplified channel grouping, scene restoration and canvas-pyramid preparation.
   Centralized metadata refresh batching and documented coordinate conventions,
   lazy overview sampling and reversible scene state, preserving viewing behavior.

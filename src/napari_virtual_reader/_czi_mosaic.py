@@ -15,8 +15,9 @@ pixels; decoding starts in ``_Piece.read`` when Dask requests a chunk.
 """
 
 import math
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, Protocol, cast
 from uuid import uuid4
 
@@ -25,6 +26,47 @@ import numpy as np
 
 # This bounds Dask output blocks, not decoder buffers or concurrent task memory.
 _CHUNK_EDGE = 1024
+_OVERVIEW_CACHE_BYTES = 64 * 1024 * 1024
+
+_OverviewKey = tuple[str, tuple[tuple[int, int, int], ...]]
+
+
+class _OverviewCache:
+    """Share a byte-bounded LRU of generated chunks across a load's channels."""
+
+    def __init__(self, max_bytes: int = _OVERVIEW_CACHE_BYTES) -> None:
+        self.max_bytes = max_bytes
+        self._entries: OrderedDict[_OverviewKey, np.ndarray] = OrderedDict()
+        self._bytes = 0
+        self._lock = Lock()
+
+    def __getstate__(self) -> dict[str, int]:
+        # Dask workers need a fresh local cache, not copied buffers or a lock.
+        return {"max_bytes": self.max_bytes}
+
+    def __setstate__(self, state: dict[str, int]) -> None:
+        self.__init__(state["max_bytes"])
+
+    def get(self, key: _OverviewKey) -> np.ndarray | None:
+        with self._lock:
+            value = self._entries.get(key)
+            if value is not None:
+                self._entries.move_to_end(key)
+        # Consumers may modify their output; never expose the cached buffer.
+        return None if value is None else value.copy()
+
+    def put(self, key: _OverviewKey, value: np.ndarray) -> None:
+        if not value.nbytes or value.nbytes > self.max_bytes:
+            return
+        with self._lock:
+            previous = self._entries.pop(key, None)
+            if previous is not None:
+                self._bytes -= previous.nbytes
+            while self._bytes + value.nbytes > self.max_bytes:
+                _, oldest = self._entries.popitem(last=False)
+                self._bytes -= oldest.nbytes
+            self._entries[key] = value.copy()
+            self._bytes += value.nbytes
 
 
 class _FromArray(Protocol):
@@ -98,7 +140,8 @@ class _Piece:
     An empty ``order`` means scalar pixels; otherwise it selects stored colour
     components in RGB(A) order. ``factor`` classifies the pyramid level, while
     width/height and the source shape determine the actual sampling pitch.
-    Raw refkv arrays use YX or CYX; prepared scenes use YX or YXC instead.
+    Raw refkv arrays use YX or CYX; prepared scenes can have leading T/Z axes
+    and an optional trailing RGB(A) axis.
     ``channels_last`` distinguishes those layouts without reordering pixels.
     """
 
@@ -112,13 +155,19 @@ class _Piece:
     order: tuple[int, ...]
     has_c: bool
     channels_last: bool = False
+    leading_ndim: int = 0
 
     @property
     def spatial_shape(self) -> tuple[int, int]:
         """Return Y/X sizes independently of the source's colour-axis layout."""
-        return self.array.shape[:2] if self.channels_last else self.array.shape[-2:]
+        return (
+            self.array.shape[self.leading_ndim:self.leading_ndim + 2]
+            if self.channels_last else self.array.shape[-2:]
+        )
 
-    def read(self, ys: np.ndarray, xs: np.ndarray) -> np.ndarray:
+    def read(
+        self, ys: np.ndarray, xs: np.ndarray, planes: tuple[slice, ...] = (),
+    ) -> np.ndarray:
         """Read a source rectangle and select the requested rows and columns.
 
         Zarr receives basic slices so it can fetch just the intersecting chunks
@@ -130,7 +179,7 @@ class _Piece:
         # final sample indexes repeat or skip positions at clipped coarse edges.
         y0, y1 = int(ys.min()), int(ys.max()) + 1
         x0, x1 = int(xs.min()), int(xs.max()) + 1
-        selection = (slice(y0, y1), slice(x0, x1))
+        selection = planes + (slice(y0, y1), slice(x0, x1))
 
         if self.has_c:
             # refkv puts packed colour samples on C: one acquisition channel
@@ -149,7 +198,8 @@ class _Piece:
         if self.order:
             pixels = np.moveaxis(pixels, 0, -1)[..., list(self.order)]
         # np.ix_ selects the Cartesian product, not paired (y, x) coordinates.
-        return pixels[np.ix_(ys - y0, xs - x0)]
+        pixels = np.take(pixels, ys - y0, axis=self.leading_ndim)
+        return np.take(pixels, xs - x0, axis=self.leading_ndim + 1)
 
 
 class _Mosaic:
@@ -173,6 +223,8 @@ class _Mosaic:
         dtype: np.dtype,
         samples: int,
         shape: tuple[int, int] | None = None,
+        leading_shape: tuple[int, ...] = (),
+        overview_cache: _OverviewCache | None = None,
     ) -> None:
         self.pieces = pieces
         self.bounds = bounds
@@ -189,6 +241,12 @@ class _Mosaic:
         # over the same extent so those transforms also align clipped/odd edges.
         self.step = (width / self.shape[1], height / self.shape[0])
         self.index = self._index_pieces()
+        self.leading_ndim = len(leading_shape)
+        self.shape = leading_shape + self.shape
+        self.ndim = len(self.shape)
+        self.chunks = (1,) * self.leading_ndim + self.chunks
+        self.overview_cache = overview_cache
+        self._cache_id = uuid4().hex
 
     def _index_pieces(self) -> dict[tuple[int, int], list[int]]:
         """Map output-chunk bins to source pieces without reading pixels."""
@@ -214,18 +272,41 @@ class _Mosaic:
         return index
 
     def __getitem__(self, selection: tuple[slice, ...]) -> np.ndarray:
+        """Reuse generated overview chunks without caching native image pixels."""
+        if self.overview_cache is None:
+            return self._read(selection)
+        key = (
+            self._cache_id,
+            tuple(part.indices(size) for part, size in zip(selection, self.shape)),
+        )
+        cached = self.overview_cache.get(key)
+        if cached is not None:
+            return cached
+        result = self._read(selection)
+        self.overview_cache.put(key, result)
+        return result
+
+    def _read(self, selection: tuple[slice, ...]) -> np.ndarray:
         """Compose the basic slices passed by Dask, retaining zero-filled gaps.
 
         This is a small internal array adapter, not a complete NumPy indexing
         implementation. Dask handles higher-level indexing around these reads.
         """
+        leading = self.leading_ndim
+        planes = selection[:leading]
         ys, xs = (
             np.arange(*part.indices(size))
-            for part, size in zip(selection[:2], self.shape[:2])
+            for part, size in zip(
+                selection[leading:leading + 2], self.shape[leading:leading + 2],
+            )
         )
         # Allocate only this request, not the entire slide. Components stay
         # together during composition; a trailing sample slice is applied last.
-        shape = (len(ys), len(xs)) + self.shape[2:]
+        plane_shape = tuple(
+            len(range(*part.indices(size)))
+            for part, size in zip(planes, self.shape[:leading])
+        )
+        shape = plane_shape + (len(ys), len(xs)) + self.shape[leading + 2:]
         result = np.zeros(shape, dtype=self.dtype)
         if not len(ys) or not len(xs):
             return result
@@ -255,8 +336,10 @@ class _Mosaic:
             )
             if not len(output_x) or not len(output_y):
                 continue
-            result[np.ix_(output_y, output_x)] = piece.read(source_y, source_x)
-        return result[(slice(None), slice(None)) + selection[2:]]
+            result[(slice(None),) * leading + np.ix_(output_y, output_x)] = (
+                piece.read(source_y, source_x, planes)
+            )
+        return result[(slice(None),) * (leading + 2) + selection[leading + 2:]]
 
     def lazy(self) -> da.Array:
         """Build a graph without probing pixels or hashing the source hierarchy."""
@@ -278,16 +361,20 @@ def compose_scene_canvas(
     scale: np.ndarray,
     *,
     rgb: bool,
-) -> tuple[list[da.Array], tuple[float, float]]:
-    """Build a lazy canvas pyramid and its physical Y/X origin.
+    overview_cache: _OverviewCache | None = None,
+) -> tuple[list[da.Array], tuple[float, ...]]:
+    """Build a lazy T/Z/Y/X canvas pyramid and its physical origin.
 
     The caller has already checked that scenes share shapes, dtype, calibration
     and pyramid depth. ``scene_levels`` contains one pyramid per scene; origins
-    and scale use physical Y/X units. Pieces use X/Y native-pixel coordinates.
+    and scale follow the layer axes. T/Z origins must agree across scenes.
+    Only Y/X are combined; leading dimensions are chunked one plane at a time.
+    Generated overview chunks share a bounded cache; native levels stay lazy.
     """
     origin = origins.min(axis=0)
-    offsets = (origins - origin) / scale
-    scene_size = np.asarray(scene_levels[0][0].shape[:2])
+    offsets = (origins[:, -2:] - origin[-2:]) / scale[-2:]
+    leading = len(scale) - 2
+    scene_size = np.asarray(scene_levels[0][0].shape[leading:leading + 2])
     extent = (offsets + scene_size).max(axis=0)
     # Avoid an extra pixel caused only by calibration rounding near an integer.
     rounded_extent = np.rint(extent)
@@ -298,7 +385,9 @@ def compose_scene_canvas(
     # shape with its sources so the two cannot get out of sync.
     pyramid = []
     for resolution in zip(*scene_levels):
-        downsampling = scene_size / np.asarray(resolution[0].shape[:2])
+        downsampling = scene_size / np.asarray(
+            resolution[0].shape[leading:leading + 2],
+        )
         shape = tuple(int(np.ceil(length)) for length in extent / downsampling)
         pyramid.append((resolution, shape))
     # A sparse plate can span gigabytes even when its scenes are tiny. Reuse
@@ -311,7 +400,8 @@ def compose_scene_canvas(
     samples = scene_levels[0][0].shape[-1] if rgb else 0
     bounds = (0, 0, float(extent[1]), float(extent[0]))
     canvases = []
-    for resolution, shape in pyramid:
+    cache = overview_cache if overview_cache is not None else _OverviewCache()
+    for level, (resolution, shape) in enumerate(pyramid):
         pieces = [
             _Piece(
                 array=array,
@@ -324,14 +414,17 @@ def compose_scene_canvas(
                 order=(),
                 has_c=False,
                 channels_last=True,
+                leading_ndim=leading,
             )
             for array, offset in zip(resolution, offsets)
         ]
         canvas = _Mosaic(
             pieces, bounds, 1, resolution[0].dtype, samples, shape=shape,
+            leading_shape=resolution[0].shape[:leading],
+            overview_cache=cache if level >= len(scene_levels[0]) else None,
         )
         canvases.append(canvas.lazy())
-    return canvases, (origin[0], origin[1])
+    return canvases, tuple(origin)
 
 
 def assemble_czi_layers(

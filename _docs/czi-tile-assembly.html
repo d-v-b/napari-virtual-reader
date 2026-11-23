@@ -429,7 +429,8 @@ main { overflow-wrap: anywhere; }
   channel            local acquisition index
   order              RGB(A) permutation
   has_c              source has C axis
-  channels_last      prepared YX / YXC</pre><p>A piece can represent a regular image level or an irregular tile. Regular sources come first; numeric tile names follow. Prepared scene arrays reuse the same piece reader.</p></div>
+  channels_last      prepared scene layout
+  leading_ndim       retained T/Z axes</pre><p>A piece can represent a regular image level or an irregular tile. Regular sources come first; numeric tile names follow. Prepared scene arrays reuse the same piece reader.</p></div>
 </div>
 <details><summary>How the resolution factor is classified</summary><p>Equal native and stored sizes mean native resolution. Otherwise the classifier uses the longer stored axis, choosing Y on ties. It checks powers of two before powers of three, with the tolerances specified by refkv's CZI profile. It does not simply round to the nearest power. Unknown factors remain unassembled.</p></details>
 <p>Irregular placement, overlap and interior clipping can prevent refkv from exposing a level as one regular array. Different tile sizes alone are not proof that assembly is impossible.</p>
@@ -516,9 +517,9 @@ napari_translate_x = native_pixel_size_x * (x0 + (finest_step_x - 1) / 2)</pre><
 <div class="frame"><svg class="ve-svg" viewBox="0 0 900 285" role="img" aria-label="Matching scene arrays are placed as pieces, indexed by output chunk, and sampled into one lazy canvas pyramid per channel." style="--ve-min: 772px">
 <path class="ve-e" d="M240 110H345"/><text class="ve-el" x="292" y="87">places</text>
 <path class="ve-e" d="M555 110H660"/><text class="ve-el" x="607" y="87">samples</text>
-<g class="ve-n"><rect class="sh" x="30" y="65" width="210" height="90"/><text x="135" y="91">Original scenes</text><text class="sub" x="135" y="117">lazy YX or YXC</text><text class="sub" x="135" y="140">stored pyramid arrays</text></g>
+<g class="ve-n"><rect class="sh" x="30" y="65" width="210" height="90"/><text x="135" y="91">Original scenes</text><text class="sub" x="135" y="117">lazy T/Z/Y/X + RGB</text><text class="sub" x="135" y="140">stored pyramid arrays</text></g>
 <g class="ve-n"><rect class="sh" x="345" y="65" width="210" height="90"/><text x="450" y="91">Spatial pieces</text><text class="sub" x="450" y="117">physical origins</text><text class="sub" x="450" y="140">output-chunk bins</text></g>
-<g class="ve-n is-key"><rect class="sh" x="660" y="65" width="210" height="90"/><text x="765" y="91">One channel layer</text><text class="sub" x="765" y="117">spatial canvas</text><text class="sub" x="765" y="140">lazy overviews</text></g>
+<g class="ve-n is-key"><rect class="sh" x="660" y="65" width="210" height="90"/><text x="765" y="91">One channel layer</text><text class="sub" x="765" y="117">T/Z + spatial Y/X</text><text class="sub" x="765" y="140">cached overviews</text></g>
 <path class="ve-e is-async" d="M765 165V215H135V165"/><text class="ve-el" x="450" y="202">switch back to S: restore original scene arrays</text>
 <text class="note" x="30" y="263">Scene composition adds display overviews, not missing source tiles or native detail.</text>
 </svg></div>
@@ -529,8 +530,25 @@ napari_translate_x = native_pixel_size_x * (x0 + (finest_step_x - 1) / 2)</pre><
 <div><h3>Scene composition makes a display canvas</h3><p><code>compose_scene_canvas</code> converts scene origins into a common pixel frame. It reuses stored scene levels, then samples extra overviews when the canvas remains too large.</p></div>
 </div>
 <p>Overview generation halves the output shape until its longest side fits an output chunk. Each added overview keeps the common extent and reads intersecting regions from the coarsest available scene sources. No dense full-resolution canvas is needed.</p>
-<p>Matching 2D Y/X scenes without rotation or shear keep one layer per acquisition channel in both modes. Native S stacks can also hold compatible higher-dimensional scenes, but their canvas view retains separate layers. Other nonmatching scenes retain the dock slider and individual layers.</p>
+<p>Matching S/T/C/Z/Y/X scenes keep one layer per acquisition channel in both modes. The canvas composes S in Y/X and retains T/Z, with one plane per output chunk. Scenes need shared T/Z origins, matching shapes, scales, dtypes and pyramids, without rotation, shear or extra affine transforms. Unsupported scenes retain individual layers.</p>
 <p>The canvas fills gaps with zero, gives later numeric scenes overlap priority and uses nearest-neighbour sampling for fractional placement. The dock preserves source arrays, pyramid levels and display settings for the return to native S.</p>
+<figure>
+<div class="frame"><svg class="ve-svg" viewBox="0 0 900 330" role="img" aria-label="A generated overview request checks a shared cache. Hits reuse pixels; misses compose a chunk from source scenes and cache it within a 64 MiB budget." style="--ve-min: 772px">
+<path class="ve-e" d="M230 85H340"/><text class="ve-el" x="285" y="65">looks up</text>
+<path class="ve-e is-hot" d="M560 85H670"/><text class="ve-el" x="615" y="65">hit: reuses</text>
+<path class="ve-e" d="M510 120V200"/><text class="ve-el r" x="522" y="165">miss</text>
+<path class="ve-e" d="M390 200V120"/><text class="ve-el l" x="378" y="165">stores</text>
+<path class="ve-e" d="M560 235H775V120"/><text class="ve-el" x="667" y="219">returns pixels</text>
+<g class="ve-n"><rect class="sh" x="30" y="50" width="200" height="70"/><text x="130" y="76">Overview request</text><text class="sub" x="130" y="102">T / Z / level / region</text></g>
+<g class="ve-n is-key"><rect class="sh" x="340" y="50" width="220" height="70"/><text x="450" y="76">Shared LRU cache</text><text class="sub" x="450" y="102">channels + levels</text></g>
+<g class="ve-n"><rect class="sh" x="670" y="50" width="200" height="70"/><text x="770" y="76">Display overview</text><text class="sub" x="770" y="102">chosen plane only</text></g>
+<g class="ve-n"><rect class="sh" x="340" y="200" width="220" height="70"/><text x="450" y="226">Compose chunk</text><text class="sub" x="450" y="252">decode source scenes</text></g>
+<g class="ve-dim"><path class="ext" d="M340 278V314M560 278V314"/><path class="ln" d="M340 305H560M336 309l8-8M556 309l8-8"/><text x="450" y="299">64 MiB total cache</text></g>
+</svg></div>
+<figcaption><span class="fig-n">Fig. 7</span>Generated overview hits skip source reads; the byte limit evicts least-recently-used chunks across channels and levels.</figcaption>
+</figure>
+<p>Only generated overview levels use this cache. Native and stored pyramid levels remain uncached; decoding errors still propagate. First visits can decode full source chunks even for small overviews. Cache keys separate T/Z positions, levels, channels and regions. Cached buffers are isolated from consumer edits.</p>
+<p>The cache is memory-only and starts fresh when rebuilding a canvas. Nothing is prefetched or written to disk. With a canvas selected, dragging T/Z thumbs previews the index and requests pixels only on release by default; live dragging is optional in the dock. Numeric commits, keyboard steps and playback remain immediate.</p>
 <p>Scene composition can use regular images from CZI-derived VZIP archives. It does not remove the archive's separate-tile limitation: native tile assembly still needs the live calibration summary from the original CZI.</p>
 </section>
 <section id="limits">
@@ -541,7 +559,7 @@ napari_translate_x = native_pixel_size_x * (x0 + (finest_step_x - 1) / 2)</pre><
 <div class="case" data-st="warn"><span class="chip warn">Still warned</span><h3>Some tiles or channels unused</h3><svg class="ve-mini" viewBox="0 0 240 110" role="img" aria-label="Used and unused tiles remain distinguishable"><rect class="tile" x="20" y="20" width="80" height="60"/><rect class="gap" x="120" y="20" width="80" height="60"/><text class="note" x="123" y="98">unused</text></svg></div>
 <div class="case" data-st="risk"><span class="chip risk">Not a fallback</span><h3>Missing or unreadable data</h3><svg class="ve-mini" viewBox="0 0 240 110" role="img" aria-label="Decode errors propagate rather than silently painting zeros"><rect class="tile" x="20" y="20" width="80" height="60"/><path class="line" d="M130 30L185 85M130 85L185 30"/><text class="note" x="120" y="103">error</text></svg></div>
 </div>
-<figcaption><span class="fig-n">Fig. 7</span>Only fully consumed tile arrays leave the warning count; a tile with unused acquisition channels is still reported.</figcaption>
+<figcaption><span class="fig-n">Fig. 8</span>Only fully consumed tile arrays leave the warning count; a tile with unused acquisition channels is still reported.</figcaption>
 </figure>
 <ul><li><strong>Overlap:</strong> regular sources first, then tiles in numeric name order. Later sources overwrite earlier ones; there is no blending or registration.</li><li><strong>Incomplete views:</strong> time/Z stacks, unclassified tile factors and incompatible placement/channel metadata are not assembled.</li><li><strong>No OME image:</strong> tile-only sources do not get a guessed image; inputs without any supported OME image fail explicitly.</li><li><strong>VZIP:</strong> reopening lacks the live factor summary. The saved original reference layout is not this runtime composition.</li><li><strong>Warnings:</strong> remaining tiles produce one source-load warning and <code>metadata["reader_warning"]</code>.</li><li><strong>Provenance:</strong> <code>metadata["czi_assembly"]</code> records bounds, factors, full-resolution availability, incorporated tile count, overlap and sampling policies.</li></ul>
 <div class="boundary-note"><strong>Use the original CZI for assembly.</strong> ZEN/libCZI may choose different overlapping tiles, and codec rounding can differ. Validate pixels independently before quantitative use.</div>
